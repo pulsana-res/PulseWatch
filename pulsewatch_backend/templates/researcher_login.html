@@ -1,0 +1,26 @@
+{% extends "researcher_base.html" %}
+{% block title %}Researcher login &mdash; Pulsana{% endblock %}
+{% block content %}
+<div style="max-width:440px; margin:24px auto 0;">
+  <div class="eyebrow">Researcher portal</div>
+  <h1 style="font-size:1.9rem; margin-bottom:24px;">Researcher login</h1>
+
+  <div class="consent-box" style="padding:28px;">
+    {% if error %}
+    <div style="background:var(--coral-tint); border:1px solid #ecc2ca; color:#A14A3A; border-radius:var(--radius-s); padding:12px 14px; font-size:.88rem; margin-bottom:18px;">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST">
+      <label style="display:block; font-family:var(--font-mono); font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-soft); margin-bottom:6px;" for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" required
+        style="width:100%; padding:12px 14px; border-radius:var(--radius-s); border:1px solid var(--line); background:var(--paper); color:var(--ink); font-family:var(--font-body); font-size:.95rem; margin-bottom:16px;">
+
+      <label style="display:block; font-family:var(--font-mono); font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-soft); margin-bottom:6px;" for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required
+        style="width:100%; padding:12px 14px; border-radius:var(--radius-s); border:1px solid var(--line); background:var(--paper); color:var(--ink); font-family:var(--font-body); font-size:.95rem; margin-bottom:22px;">
+
+      <button class="btn btn-primary btn-block" type="submit">Log in</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

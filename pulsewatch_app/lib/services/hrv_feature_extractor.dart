@@ -1,0 +1,331 @@
+import 'dart:math' as math;
+import 'database_helper.dart';
+
+/// A single BLE sample bundled for HRV analysis.
+/// Public so today_screen.dart and ble_service.dart can share this type.
+class BpmSample {
+  final DateTime time;
+  final double bpm;
+  final double ax, ay, az; // raw accelerometer counts from Bangle.js, in milli-g (accel * 1000)
+  final double rr; // real beat-to-beat RR interval (ms) from the watch, 0 if unavailable
+
+  const BpmSample({
+    required this.time,
+    required this.bpm,
+    required this.ax,
+    required this.ay,
+    required this.az,
+    this.rr = 0,
+  });
+}
+
+/// Computes the 22 HRV + accel features the trained model expects, from a
+/// rolling BPM window.
+/// Most features are derived from BPM and accelerometer data available over
+/// BLE. PPG-morphology features (systolic_upslope, ai_index) aren't
+/// measurable from BPM alone — held at the training-set mean, which is
+/// harmless: they carry 0% importance in the trained model. The
+/// accelerometer-derived features below (sedentary_time_ratio, accel_entropy,
+/// movement_variability) are NOT low-importance — they're the model's
+/// dominant signal (44% / 26% / 7% respectively) and are computed live here.
+class HrvFeatureExtractor {
+  static const int minSamples = 60; // ~1 min minimum for any meaningful HRV
+
+  static Map<String, double> compute(List<BpmSample> window) {
+    if (window.length < minSamples) return _zeros();
+
+    // RR intervals (ms) — use the watch's real beat-to-beat value when
+    // available, falling back to a BPM-derived approximation only for
+    // samples where the watch didn't report one (rr <= 0). Then drop
+    // physiologically-impossible outliers (<300ms / >2000ms) — matches
+    // fromDaria/feature_extractor.py's `rr[(rr>300)&(rr<2000)]`, which the
+    // trained model's HRV features were fit on; an unfiltered fallback RR
+    // from a garbage BPM reading could otherwise swing rmssd/sdnn/pnn50/
+    // tri_index/mean_rr wildly.
+    final rr = window
+        .map((s) => s.rr > 0 ? s.rr : 60000.0 / s.bpm)
+        .where((v) => v > 300 && v < 2000)
+        .toList();
+    final n = rr.length;
+    final bpms = window.map((s) => s.bpm).toList();
+    // The watch sends accel*1000 (milli-g — see bangle/lib.js's
+    // Math.round(accel.x * 1000)), but fromDaria's reference implementation
+    // — what the model was actually trained on — used raw g-units. Every
+    // accel-derived feature below must convert back, or it's off by 1000x.
+    // This single conversion is the single highest-impact correctness fix
+    // here: sedentary_time_ratio + accel_entropy + movement_variability
+    // together are 78% of the trained model's total decision weight (see
+    // assets/models/feature_importance.json), and all three are computed
+    // from this one `mags` list.
+    final mags = window
+        .map((s) => math.sqrt(s.ax * s.ax + s.ay * s.ay + s.az * s.az) / 1000.0)
+        .toList();
+
+    // ── Time-domain HRV ──────────────────────────────────────────────────────
+    final meanRr = _mean(rr);
+    final sdnn = _std(rr);
+
+    final diffs = <double>[];
+    for (int i = 1; i < n; i++) {
+      diffs.add((rr[i] - rr[i - 1]).abs());
+    }
+    final rmssd = diffs.isEmpty
+        ? 0.0
+        : math.sqrt(
+            diffs.map((d) => d * d).reduce((a, b) => a + b) / diffs.length);
+    final pnn50 =
+        diffs.isEmpty ? 0.0 : diffs.where((d) => d > 50).length / diffs.length;
+    final triIndex = _triIndex(rr);
+
+    // ── Frequency-domain HRV (simple rectangular DFT — approximate) ─────────
+    // RR magnitudes are now the watch's real beat-to-beat values (see rr
+    // above), but the DFT still treats the series as evenly sampled in time
+    // at the BLE reporting rate rather than using true beat timestamps —
+    // LF/HF are still approximate, just less so than before.
+    final detrended = rr.map((v) => v - meanRr).toList();
+    final bands = _spectralBands(detrended, 1.0);
+    final lfPower = bands['lf']!;
+    final hfPower = bands['hf']!;
+    final lfHfRatio = hfPower > 1e-10 ? lfPower / hfPower : 0.0;
+    final totalPower = bands['total']!;
+
+    // ── Accelerometer features ───────────────────────────────────────────────
+    final movVar = _std(mags);
+    // Absolute stillness threshold in g-units — matches fromDaria's
+    // `accel_mag < 0.05`. Previously this checked "within 10% of the
+    // session's own mean magnitude", a different definition that also
+    // produces a different number for the same data.
+    final sedRatio = mags.where((m) => m < 0.05).length / mags.length;
+    final accelEntropy = _entropyLikeReference(mags);
+
+    // ── HR dynamics ──────────────────────────────────────────────────────────
+    final pulseAmp = rr.isEmpty ? 0.0 : rr.reduce(math.max) - rr.reduce(math.min);
+    // Step-count proxy: jerk events above a 0.1g threshold between
+    // consecutive samples — matches fromDaria's `steps_est`. Previously this
+    // held a correlation coefficient (that's chronotropic_index's formula,
+    // not hr_step_ratio's) — the two were swapped.
+    int stepsEst = 0;
+    for (int i = 1; i < mags.length; i++) {
+      if ((mags[i] - mags[i - 1]).abs() > 0.1) stepsEst++;
+    }
+    final meanBpm = _mean(bpms);
+    final hrStepRatio = meanBpm / (stepsEst + 1);
+    final chronoIndex = _correlation(mags, bpms);
+
+    final now = window.last.time;
+    final slope1m = _slope(window
+        .where((s) => now.difference(s.time) <= const Duration(seconds: 60))
+        .map((s) => s.bpm)
+        .toList());
+    final slope3m = _slope(window
+        .where((s) => now.difference(s.time) <= const Duration(seconds: 180))
+        .map((s) => s.bpm)
+        .toList());
+
+    print(
+        '[HrvFeatureExtractor] computed ${window.length} samples  rmssd=${rmssd.toStringAsFixed(1)}  lf/hf=${lfHfRatio.toStringAsFixed(2)}');
+
+    return {
+      'mean_rr': meanRr,
+      'sdnn': sdnn,
+      'rmssd': rmssd,
+      'pnn50': pnn50,
+      'tri_index': triIndex,
+      'lf_power': lfPower,
+      'hf_power': hfPower,
+      'lf_hf_ratio': lfHfRatio,
+      'total_power': totalPower,
+      'pulse_amplitude': pulseAmp,
+      // PPG waveform features unavailable from BPM stream (no raw PPG over
+      // BLE). Set to training-set mean so the StandardScaler outputs ~0
+      // (neutral). Both are genuinely 0% importance in the trained model,
+      // so this has no effect on the score.
+      'systolic_upslope': 1262.26,
+      'ai_index': 2.39,
+      'hr_step_ratio': hrStepRatio,       // 1.4% importance — computed live
+      'chronotropic_index': chronoIndex,  // 0% importance — computed but unused by the model
+      'recovery_slope_1min': slope1m,
+      'recovery_slope_3min': slope3m,
+      'accel_entropy': accelEntropy,      // 26% importance — second-biggest driver
+      'movement_variability': movVar,     // 7% importance
+      'sedentary_time_ratio': sedRatio,   // 44% importance — the model's dominant feature
+      // Long-term circadian features require overnight DB — set to training mean.
+      // nocturnal_hr_mean=0.0 was -6.8 sigma after scaling (critical outlier).
+      'nocturnal_hr_mean': 83.62,        // training mean, 2.1% importance
+      'hrv_circadian_amplitude': 60.57,  // training mean, 1.2% importance
+      'sleep_fragmentation_index': 0.051, // training mean, 2.3% importance
+    };
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  /// Computes nocturnal HR features from the SQLite database, using the
+  /// night ending at/before [sessionEnd] rather than "today"/"the last 24h"
+  /// relative to DateTime.now() — a report computed some time after a
+  /// session actually ended (see ReportService.computeReport) still needs
+  /// that session's own last night, not whatever night is current when the
+  /// computation happens to run.
+  /// Falls back to training-set means when insufficient data exists.
+  /// Training means chosen so StandardScaler outputs 0 (neutral z-score).
+  static Future<Map<String, double>> computeNocturnal(DatabaseHelper db, {required DateTime sessionEnd}) async {
+    const kNoctMean   = 83.62;
+    const kCircadian  = 60.57;
+    const kFrag       = 0.051;
+
+    final noctBpms = await db.getNocturnalHR(reference: sessionEnd);
+    final double noctMean = noctBpms.isNotEmpty
+        ? noctBpms.reduce((a, b) => a + b) / noctBpms.length
+        : kNoctMean;
+
+    final hourlyMeans = await db.getHourlyMeanHR(24, before: sessionEnd);
+    final double circadian = hourlyMeans.length >= 6
+        ? hourlyMeans.reduce(math.max) - hourlyMeans.reduce(math.min)
+        : kCircadian;
+
+    double fragmentation = kFrag;
+    if (noctBpms.length >= 5) {
+      int jumps = 0;
+      for (int i = 1; i < noctBpms.length; i++) {
+        if ((noctBpms[i] - noctBpms[i - 1]).abs() > 10) jumps++;
+      }
+      fragmentation = jumps / (noctBpms.length - 1);
+    }
+
+    print('[HrvFeatureExtractor] nocturnal: mean=${noctMean.toStringAsFixed(1)} '
+        'circ=${circadian.toStringAsFixed(1)} '
+        'frag=${fragmentation.toStringAsFixed(3)} '
+        '(n=${noctBpms.length} sleep samples)');
+
+    return {
+      'nocturnal_hr_mean': noctMean,
+      'hrv_circadian_amplitude': circadian,
+      'sleep_fragmentation_index': fragmentation,
+    };
+  }
+
+  static double _mean(List<double> v) {
+    if (v.isEmpty) return 0.0;
+    return v.reduce((a, b) => a + b) / v.length;
+  }
+
+  static double _std(List<double> v) {
+    if (v.length < 2) return 0.0;
+    final m = _mean(v);
+    final variance =
+        v.map((x) => (x - m) * (x - m)).reduce((a, b) => a + b) / (v.length - 1);
+    return math.sqrt(variance);
+  }
+
+  static double _triIndex(List<double> rr) {
+    if (rr.length < 10) return 0.0;
+    const binSize = 8.0; // 8 ms bins (standard)
+    final minV = rr.reduce(math.min);
+    final maxV = rr.reduce(math.max);
+    final numBins = ((maxV - minV) / binSize).ceil() + 1;
+    if (numBins <= 0) return 0.0;
+    final hist = List<int>.filled(numBins, 0);
+    for (final v in rr) {
+      final bin = ((v - minV) / binSize).floor().clamp(0, numBins - 1);
+      hist[bin]++;
+    }
+    final peak = hist.reduce(math.max);
+    return peak > 0 ? rr.length / peak.toDouble() : 0.0;
+  }
+
+  /// Computes LF, HF, and total band powers in one DFT pass.
+  /// Uses a simple rectangular DFT (no windowing) — approximate but consistent.
+  /// signal must be detrended (DC removed). sampleRate in Hz.
+  static Map<String, double> _spectralBands(
+      List<double> signal, double sampleRate) {
+    final n = signal.length;
+    if (n < 4) return {'lf': 0.0, 'hf': 0.0, 'total': 0.0};
+
+    double lf = 0.0, hf = 0.0, total = 0.0;
+
+    for (int k = 1; k < n ~/ 2; k++) {
+      final freq = k * sampleRate / n;
+      double re = 0.0, im = 0.0;
+      for (int j = 0; j < n; j++) {
+        final angle = 2.0 * math.pi * k * j / n;
+        re += signal[j] * math.cos(angle);
+        im -= signal[j] * math.sin(angle);
+      }
+      final power = (re * re + im * im) / (n.toDouble() * n.toDouble());
+
+      if (freq >= 0.003 && freq <= 0.40) total += power;
+      if (freq >= 0.04 && freq <= 0.15) lf += power;
+      if (freq >= 0.15 && freq <= 0.40) hf += power;
+    }
+
+    return {'lf': lf, 'hf': hf, 'total': total};
+  }
+
+  /// Replicates fromDaria/feature_extractor.py's accel_entropy exactly:
+  /// `-sum(p*log(p+1e-9) for p in histogram(mag,bins=10,density=True)[0]/10)`.
+  /// numpy's density histogram (`count / (N * binWidth)`) is divided by the
+  /// bin count *again* before the entropy sum — not standard Shannon entropy
+  /// normalization, but reproducing it exactly is what matters: this is the
+  /// model's second-highest-weighted feature (26%), so matching the
+  /// reference bit-for-bit beats using a "more correct" formula that the
+  /// model wasn't trained on.
+  static double _entropyLikeReference(List<double> vals) {
+    const numBins = 10;
+    if (vals.length < 2) return 0.0;
+    final minV = vals.reduce(math.min);
+    final maxV = vals.reduce(math.max);
+    final range = maxV - minV;
+    if (range < 1e-10) return 0.0;
+    final binWidth = range / numBins;
+    final counts = List<int>.filled(numBins, 0);
+    for (final v in vals) {
+      final bin = ((v - minV) / binWidth).floor().clamp(0, numBins - 1);
+      counts[bin]++;
+    }
+    final n = vals.length;
+    double entropy = 0.0;
+    for (final count in counts) {
+      final density = count / (n * binWidth);
+      final p = density / numBins;
+      entropy -= p * math.log(p + 1e-9);
+    }
+    return entropy;
+  }
+
+  static double _correlation(List<double> x, List<double> y) {
+    if (x.length != y.length || x.length < 2) return 0.0;
+    final mx = _mean(x), my = _mean(y);
+    double num = 0.0, dx2 = 0.0, dy2 = 0.0;
+    for (int i = 0; i < x.length; i++) {
+      final xi = x[i] - mx, yi = y[i] - my;
+      num += xi * yi;
+      dx2 += xi * xi;
+      dy2 += yi * yi;
+    }
+    final denom = math.sqrt(dx2 * dy2);
+    return denom > 1e-10 ? num / denom : 0.0;
+  }
+
+  static double _slope(List<double> vals) {
+    if (vals.length < 2) return 0.0;
+    final meanX = (vals.length - 1) / 2.0;
+    final meanY = _mean(vals);
+    double num = 0.0, denom = 0.0;
+    for (int i = 0; i < vals.length; i++) {
+      num += (i - meanX) * (vals[i] - meanY);
+      denom += (i - meanX) * (i - meanX);
+    }
+    return denom > 1e-10 ? num / denom : 0.0;
+  }
+
+  static Map<String, double> _zeros() => {
+        'mean_rr': 0.0, 'sdnn': 0.0, 'rmssd': 0.0, 'pnn50': 0.0,
+        'tri_index': 0.0, 'lf_power': 0.0, 'hf_power': 0.0,
+        'lf_hf_ratio': 0.0, 'total_power': 0.0, 'pulse_amplitude': 0.0,
+        'systolic_upslope': 0.0, 'ai_index': 0.0,
+        'hr_step_ratio': 0.0, 'chronotropic_index': 0.0,
+        'recovery_slope_1min': 0.0, 'recovery_slope_3min': 0.0,
+        'accel_entropy': 0.0, 'movement_variability': 0.0,
+        'sedentary_time_ratio': 0.0, 'nocturnal_hr_mean': 0.0,
+        'hrv_circadian_amplitude': 0.0, 'sleep_fragmentation_index': 0.0,
+      };
+}

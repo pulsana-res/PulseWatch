@@ -1,0 +1,114 @@
+0.08: Reclaim flash left behind by erased files, safely (2026-08-26)
+- Storage.erase() (used both by deleteAllData() and the per-file erase the
+  phone sends after each synced file - see ble_service.dart's
+  _readNextFileBangle) only frees a file's slot in Espruino's Storage index;
+  it doesn't reclaim the underlying flash. Nothing in this app ever called
+  Storage.compact(), so every erase left permanently unreclaimed "trash" -
+  with a new ~12KB file written and erased roughly every 5 minutes of
+  recording, that accumulates indefinitely until Storage fills with dead
+  entries and saveData() starts silently failing to write new files
+- NEW: exports.compactStorage() (lib.js), called from deleteAllData() and
+  from the phone's sync flow (via 'require("pulsewatch").compactStorage()'
+  - never Storage.compact() directly) once per sync round that actually
+  erased a file. Two safety guards, because Storage.compact() has a real
+  history of corrupting Bangle.js2 storage and wiping installed apps:
+  - Refuses to run below firmware 2v26. A confirmed nRF52 flash-write bug
+    (github.com/espruino/Espruino/issues/2509, fixed by commit 840271c112)
+    could corrupt the whole Storage area and delete apps/files when
+    compact() wrote more than 2KB internally - fixed in the 2v26 release
+    (2025-05-09). Older firmware silently skips compaction instead
+  - Only compacts once Storage.getStats().trashBytes exceeds 200KB, so it
+    doesn't run - and take on that risk - on every sync tick for one small
+    erased file
+  REQUIRES watch firmware 2v26 or later for compaction to actually run at
+  all (check via the Web IDE or `process.env.VERSION` in the BLE console).
+  On older firmware this version behaves exactly like 0.07 - trash still
+  accumulates, but nothing new runs against Storage
+- NEW: on-watch menu (app.js) now shows "Firmware" (process.env.VERSION)
+  and "Auto-Compact" (On/Off) so this can be checked from the watch itself
+  without the BLE console
+
+0.07: Fix saveData() so files are actually findable, plus ghost-file cleanup (2026-08-06)
+- CRITICAL FIX: saveData() used Storage.open()/StorageFile (chunked writes)
+  instead of a plain Storage.write(). Espruino appends a raw chunk-number
+  byte as the last character of a StorageFile's stored name, which broke
+  every `.csv$`-anchored regex in this app (watch's own status menu,
+  deleteAllData(), and the phone's file-sync request) - files were written
+  successfully and permanently consumed flash, but Storage.list() could
+  never find them, so nothing was ever synced to the phone or erased from
+  the watch. This is why "Data Files" always showed 0 even as "Total
+  Records" kept climbing. saveData() now does a single plain
+  Storage.write(filename, csvText) - per-flush data is at most ~300 rows
+  (~12KB), comfortably within one write, no chunking needed
+- NEW: one-time migration (cleanupGhostStorageFiles(), runs automatically
+  on first load of this version, gated by a pulsewatch.json flag) finds and
+  erases pre-fix StorageFile ghost chunks left behind by the bug above
+- FIXED: deleteAllData() had the same list() blind spot - "delete all" now
+  actually erases StorageFile ghost chunks too, not just plain files
+- Runtime console now logs "PulseWatch vX.XX loaded" on every load, so the
+  BLE console/log immediately shows which firmware version is actually
+  running on the watch - this exact question ate significant debugging
+  time this session
+- Removed a few leftover confused debugging comments in app.js/boot.js/
+  lib.js and a genuinely-unused `storageFile` variable
+
+0.06: Remove live BLE streaming, file-sync is now the only data path (2026-08-05)
+- REMOVED: liveBuffer/flushLiveBuffer/liveFlushTimer and the 15s batched
+  BLE transmission in exports.start()/stop()/reload()
+- Live streaming wasn't load-bearing for the phone's risk-score pipeline
+  and added a second code path (plus a live-vs-file-sync disambiguation
+  hack on the phone side, since the two were byte-identical in shape)
+- dataBuffer (the 5-minute flash-backed buffer written by saveData()) is
+  unaffected - the watch keeps recording to pw*.csv exactly as before,
+  the phone now only ever receives data through the existing file-sync
+  flow
+- FIXED: app-icon.js had broken syntax (";" instead of ":" in the image
+  descriptor object) - would have thrown on the watch if ever loaded
+- Wired app-icon.js in as the actual launcher icon: metadata.json now
+  evaluates it into a "pulsewatch.img" storage entry, and "icon":"app.png"
+  is set for the App Loader listing thumbnail. Previously neither was
+  referenced anywhere, so the app installed and ran with no icon
+- metadata.json storage now lists 5 files instead of 4 - when using
+  "Install App from Files", app-icon.js must be selected alongside
+  app.js, lib.js, boot.js, widget.js, and metadata.json, or the icon
+  entry will be uploaded with no content
+
+0.05: Persist recording flag on start()/stop() (2026-07-25)
+- FIXED: exports.start()/stop() now write recording:true/false to
+  pulsewatch.json, not just the in-memory isRecording flag
+- Previously only the watch's own menu toggle persisted this, so recording
+  triggered remotely by the phone (BLE auto-start on connect) never lit the
+  widget's green recording dot, and never auto-resumed after a watch reboot
+  mid-session (boot.js/widget.js only resume based on this persisted flag)
+
+0.04: Fix Timestamp Format + Database Migration (2025-01-12)
+- CRITICAL FIX: Timestamps now integers (Math.floor) instead of floats with decimals
+- Fixes parsing error: "FormatException: Invalid radix-10 number" in Flutter app
+- All Date.now() calls now wrapped with Math.floor() to ensure integer timestamps
+- Flutter database migration added: v1→v2 adds confidence column to existing databases
+- This fixes "table heart_rate has no column named confidence" SQL error
+- No app reinstall needed - migration runs automatically on first launch
+
+0.03: BLE Fix + App Loader Compatibility (2025-01-12)
+- FIXED: BLE transmission now uses Bluetooth.println() instead of NRF.send()
+- Now sends data via proper Nordic UART Service (UUID 6e400002/6e400003)
+- Live data streaming to Flutter app working
+- Added debug logging every 10 readings
+- Updated metadata.json for BangleApps App Loader compatibility
+- Added data wildcard for CSV files in metadata
+- Format: lib.js → "pulsewatch" (no extension) for proper require()
+
+0.02: Added control interface
+- App now appears in launcher menu
+- View status (recording state, file count, storage used)
+- View statistics (detailed info)
+- Delete data manually (for testing)
+- Toggle recording on/off
+- Green dot widget indicator
+
+0.01: Initial release
+- Background heart rate monitoring
+- Accelerometer data collection
+- Automatic 5-minute interval saves (testing)
+- Green dot widget indicator
+- Silent operation - no user interaction needed

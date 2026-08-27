@@ -1,0 +1,1297 @@
+import 'dart:async';
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import '../l10n/app_localizations.dart';
+import '../theme/app_theme.dart';
+import '../services/auth_service.dart';
+import '../services/background_sync_service.dart';
+import '../services/database_helper.dart';
+import '../services/ble_service.dart';
+import '../services/notification_service.dart';
+import '../services/report_service.dart';
+import '../services/server_service.dart';
+import '../services/sync_log_service.dart';
+import '../services/upload_consent_service.dart';
+import 'report_screen.dart';
+import '../widgets/loading_state.dart';
+import '../widgets/save_session_sheet.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+
+/// Home dashboard — the first thing a user sees. Answers, at a glance:
+/// is the watch connected, how much data have we collected toward the
+/// 48h goal, and is there anything the user needs to go do (connect the
+/// watch, upload data). Before the 48h goal is reached it also surfaces a
+/// few real, already-computed facts (overnight HR, signal quality, wear
+/// coverage, movement) so the screen has something honest to show besides
+/// a bare progress number.
+///
+/// The cardiac risk score is only ever computed once, from the full 48h
+/// session (see ReportService) — never from a short live window, which
+/// isn't how the model was trained/evaluated and produced unreliable
+/// high-risk false positives.
+class HomeScreen extends StatefulWidget {
+  final void Function(int tabIndex) onNavigateToTab;
+  // Optional spotlight anchors for the new-signup coach-mark walkthrough
+  // (see MainNavigation) — null outside that flow.
+  final GlobalKey? watchStatusKey;
+  final GlobalKey? progressCardKey;
+
+  const HomeScreen({
+    super.key,
+    required this.onNavigateToTab,
+    this.watchStatusKey,
+    this.progressCardKey,
+  });
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final DatabaseHelper _db = DatabaseHelper.instance;
+  final BleService _bleService = BleService();
+  final ServerService _server = ServerService.instance;
+
+  // True only until the first _loadStats() completes — after that it stays
+  // false permanently (the 10s periodic refresh updates numbers in place,
+  // it doesn't re-show a loading state). Without this, a cold start after
+  // Android killed the backgrounded process rendered every stat at its
+  // zero/default value for as long as the ~7 sequential DB queries in
+  // _loadStats() took, which read as "showing old data" until it "caught
+  // up" — this makes the wait explicit instead.
+  bool _loading = true;
+  bool _isConnected = false;
+  int _coverageHours = 0; // distinct hours with data in the last 48h
+  int _totalReadings = 0; // used only to detect the "connected, nothing collected yet" gap
+  UploadHealth _uploadHealth = UploadHealth.ok;
+
+  String? _displayName;
+  int? _restingHR;
+  int _signalQuality = 0;
+  int _hoursWornToday = 0;
+  int _gapsToday = 0;
+  String _movementLabel = '--';
+  String _movementCaption = 'Not enough data yet';
+
+  static const _collectionGoalHours = 48;
+
+  FinalReport? _report;
+  bool _generatingReport = false;
+  bool _savingSession = false;
+
+  // The fixed point "the current session" is measured from — see
+  // ReportService.getSessionStart for why this can't just be "the last 48h
+  // from now". Loaded once in _loadStats and reused for every
+  // coverage/report calculation below.
+  DateTime? _sessionStart;
+
+  // True after "Save & stop for now" until "Start a new recording" is
+  // tapped — see ReportService.isPaused. Takes priority over every other
+  // _buildMainSection state: there's no "coverage" to show progress toward
+  // when nothing is being collected.
+  bool _paused = false;
+  bool _startingRecording = false;
+
+  // Set when _loadStats throws instead of completing — without this, a
+  // failed DB read left the screen stuck on "Loading your dashboard…"
+  // forever (see insights_screen.dart's _load, which already guarded
+  // against the same class of failure). Holding the raw exception text
+  // (not just a boolean) means a screenshot of this card is enough to
+  // diagnose a real report, since there's no debug panel on a release
+  // build to pull logs from.
+  String? _loadError;
+
+  Timer? _statsTimer;
+  Timer? _uploadHealthTimer;
+
+  StreamSubscription? _connectionSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+
+    NotificationService.initialize();
+    _isConnected = _bleService.isConnected;
+    _loadDisplayName();
+    _loadStats();
+    _statsTimer = Timer.periodic(const Duration(seconds: 10), (_) => _loadStats());
+
+    // Separate, much less frequent timer: checkUploadHealth() makes a real
+    // network call when there's pending data, which the 10s stats poll
+    // above is far too tight an interval for.
+    _loadUploadHealth();
+    _uploadHealthTimer = Timer.periodic(const Duration(minutes: 5), (_) => _loadUploadHealth());
+
+    // The battery-exemption prompt used to be triggered from here too, but
+    // this screen is unmounted whenever another tab is active — it now
+    // lives in MainNavigation (main.dart), which never unmounts, so it
+    // can't miss a connection that completes while some other tab is open.
+    _connectionSubscription = _bleService.connectionStateStream.listen((state) {
+      if (mounted) {
+        setState(() {
+          _isConnected = (state == BluetoothConnectionState.connected);
+        });
+      }
+    });
+  }
+
+  Future<void> _loadDisplayName() async {
+    final username = await AuthService.instance.getUsername();
+    if (!mounted || username == null || username.trim().isEmpty) return;
+    final first = username.trim().split(RegExp(r'[ _.]+')).first;
+    final capitalized = first.isEmpty ? first : '${first[0].toUpperCase()}${first.substring(1)}';
+    setState(() => _displayName = capitalized);
+  }
+
+  /// Only meaningful for users who've opted into automatic upload — if
+  /// they haven't, there's no expectation of automatic delivery to fall
+  /// short of, so there's nothing to warn about here.
+  Future<void> _loadUploadHealth() async {
+    final consented = await UploadConsentService.instance.hasConsented();
+    final health = consented ? await _server.checkUploadHealth() : UploadHealth.ok;
+    if (mounted) setState(() => _uploadHealth = health);
+  }
+
+  /// Kicks off the one-time full-session report once 48h of data has been
+  /// collected. No-op if a report already exists or is already generating.
+  Future<void> _maybeGenerateReport() async {
+    if (_report != null || _generatingReport) return;
+    if (_coverageHours < _collectionGoalHours || _sessionStart == null) return;
+
+    setState(() => _generatingReport = true);
+    final report = await ReportService.computeReport(_db, sessionStart: _sessionStart!);
+    if (!mounted) return;
+    setState(() {
+      _generatingReport = false;
+      if (report != null) _report = report;
+    });
+
+    // There's nothing left to collect toward once the 48h report is ready —
+    // stop the watch connection and background sync immediately rather than
+    // leaving them running until the user gets around to tapping "Save
+    // session". The report itself still shows and stays fully reviewable/
+    // saveable (see _buildMainSection's priority order); only the
+    // underlying data collection stops.
+    if (report != null) {
+      await ReportService.setPaused(true);
+      await BackgroundSyncService.instance.cancel();
+      await _bleService.disconnect();
+      if (mounted) setState(() => _paused = true);
+    }
+  }
+
+  /// Archives the current report to permanent history, optionally deletes
+  /// its raw readings, then either starts a fresh 48h session right away or
+  /// pauses everything (background sync, auto-reconnect, connectivity
+  /// notifications) until the user explicitly starts a new recording from
+  /// Settings — see ReportService.isPaused.
+  Future<void> _saveSession(FinalReport report) async {
+    final choice = await showSaveSessionSheet(context);
+    if (choice == null || !mounted) return;
+
+    setState(() => _savingSession = true);
+    final sessionStart = _sessionStart ?? report.computedAt.subtract(const Duration(hours: 48));
+    await ReportService.saveReportToHistory(
+      report,
+      sessionStart: sessionStart,
+      sessionEnd: report.computedAt,
+    );
+    if (choice.deleteRawData) {
+      await ReportService.deleteSessionRawData(sessionStart: sessionStart, sessionEnd: report.computedAt);
+    }
+    await ReportService.clearCurrentReport();
+
+    final stopping = choice.action == SaveSessionAction.stop;
+    if (stopping) {
+      // Already paused/disconnected by _maybeGenerateReport the moment the
+      // report finished computing — these are safe no-ops in that case, and
+      // still necessary as a fallback for a report loaded from cache (an
+      // older session, computed before that auto-pause existed).
+      await ReportService.setPaused(true);
+      await BackgroundSyncService.instance.cancel();
+      // Cancelling the periodic task only stops future background syncs —
+      // a connection already held open (and its persistent "last reading
+      // Xm ago" notification) keeps running until something else drops it
+      // otherwise. See settings_screen.dart's _stopRecording for the same
+      // fix and BleService.disconnect's doc comment for why.
+      await _bleService.disconnect();
+    } else {
+      // The report-ready auto-pause left this paused — undo it so the new
+      // session actually starts collecting instead of sitting there paused.
+      await ReportService.setPaused(false);
+      await ReportService.startNewSession();
+      await BackgroundSyncService.instance.ensureScheduled();
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _savingSession = false;
+      _report = null;
+      _sessionStart = null;
+      _coverageHours = 0;
+      _paused = stopping;
+    });
+    final l10n = AppLocalizations.of(context)!;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(stopping ? l10n.homeReportSavedStopped : l10n.homeReportSavedNewSession),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+    await _loadStats();
+  }
+
+  Future<void> _loadStats() async {
+    try {
+      await _loadStatsImpl();
+    } catch (e) {
+      // A failed query should show a retry state, not spin forever — the
+      // user should never be stuck looking at a loading indicator with no
+      // way forward. Logged too, in case a future adb pull becomes
+      // possible, but the on-screen text below is the primary channel:
+      // there's no debug panel to view this log from on a release build.
+      await SyncLogService.instance.record(
+        source: SyncSource.interactive,
+        success: false,
+        stage: 'dashboard_load',
+        message: e.toString(),
+      );
+      if (mounted) setState(() { _loading = false; _loadError = e.toString(); });
+    }
+  }
+
+  Future<void> _loadStatsImpl() async {
+    // Checked first, independent of pause state below: the report-ready
+    // auto-pause (see _maybeGenerateReport) means "paused" and "there's a
+    // report waiting to be reviewed" can both be true at once, and the
+    // report needs to survive an app restart — not just live in this
+    // screen's in-memory state — or it'd look like it vanished the moment
+    // pausing made _loadStats return early before ever checking for it.
+    if (_report == null && !_generatingReport) {
+      final cached = await ReportService.loadCachedReport();
+      if (mounted && cached != null) setState(() => _report = cached);
+    }
+
+    // While paused there's no active session to compute coverage/reports
+    // for, and _sessionStart is left untouched by "Save & stop" (see
+    // _saveSession) rather than cleared — querying coverage against that
+    // stale anchor would otherwise look like a session had already reached
+    // 48h again the moment any old raw data still qualifies, silently
+    // re-triggering report generation the user explicitly stopped (or that
+    // already ran once and auto-paused above).
+    if (await ReportService.isPaused()) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadError = null;
+          _paused = true;
+        });
+      }
+      return;
+    }
+
+    final now = DateTime.now();
+    final todayStart = DateTime(now.year, now.month, now.day);
+    final yesterdayStart = todayStart.subtract(const Duration(days: 1));
+
+    _sessionStart ??= await ReportService.getSessionStart(_db);
+    final coverageHours = await _db.getHoursWithDataSince(_sessionStart!);
+    final totalReadings = await _db.getTotalReadings();
+
+    final nocturnal = await _db.getNocturnalHR();
+    final avgConfidence = await _db.getAvgConfidence(sinceMillis: todayStart.millisecondsSinceEpoch);
+    final hoursToday = await _db.getHoursWithDataSince(todayStart);
+    final gapsToday = await _db.findGaps(
+      threshold: const Duration(minutes: 30),
+      since: todayStart,
+      limit: 50,
+    );
+
+    final yesterdaySameClock = yesterdayStart.add(Duration(hours: now.hour, minutes: now.minute));
+    final todayMovement = await _db.getAverageMovementIntensity(start: todayStart, end: now);
+    final yesterdayMovement = await _db.getAverageMovementIntensity(
+      start: yesterdayStart,
+      end: yesterdaySameClock,
+    );
+
+    if (mounted) {
+      setState(() {
+        _loading = false;
+        _loadError = null;
+        _paused = false;
+        _coverageHours = coverageHours;
+        _totalReadings = totalReadings;
+
+        _restingHR = nocturnal.isNotEmpty
+            ? (nocturnal.reduce((a, b) => a + b) / nocturnal.length).round()
+            : null;
+        _signalQuality = avgConfidence;
+        _hoursWornToday = hoursToday;
+        _gapsToday = gapsToday.length;
+
+        final l10n = AppLocalizations.of(context)!;
+        if (todayMovement == null || yesterdayMovement == null || yesterdayMovement < 0.001) {
+          _movementLabel = '--';
+          _movementCaption = l10n.homeNotEnoughData;
+        } else {
+          final ratio = todayMovement / yesterdayMovement;
+          if (ratio > 1.1) {
+            _movementLabel = l10n.homeMoreActive;
+          } else if (ratio < 0.9) {
+            _movementLabel = l10n.homeLessActive;
+          } else {
+            _movementLabel = l10n.homeAboutTheSame;
+          }
+          _movementCaption = l10n.homeMovementCaption;
+        }
+      });
+    }
+
+    // The cached-report check at the top of this function already covers
+    // the "one exists" case — this only needs to try generating a fresh
+    // one.
+    if (_report == null && !_generatingReport) {
+      await _maybeGenerateReport();
+    }
+  }
+
+  @override
+  void dispose() {
+    _statsTimer?.cancel();
+    _uploadHealthTimer?.cancel();
+    _connectionSubscription?.cancel();
+    super.dispose();
+  }
+
+  Color _riskColor(String level) {
+    switch (level) {
+      case 'LOW':
+        return AppColors.primaryGreen;
+      case 'MEDIUM':
+        return AppColors.warning;
+      default:
+        return AppColors.error;
+    }
+  }
+
+  String _riskLabel(String level) {
+    final l10n = AppLocalizations.of(context)!;
+    switch (level) {
+      case 'LOW':
+        return l10n.homeRiskLabelLow;
+      case 'MEDIUM':
+        return l10n.homeRiskLabelModerate;
+      default:
+        return l10n.homeRiskLabelHigh;
+    }
+  }
+
+  String _formatTime(DateTime dt) {
+    return DateFormat('h:mm a', Localizations.localeOf(context).toString()).format(dt);
+  }
+
+  String _greeting() {
+    final l10n = AppLocalizations.of(context)!;
+    final hour = DateTime.now().hour;
+    final name = _displayName;
+    if (hour < 12) return name == null ? l10n.homeGreetingMorning : l10n.homeGreetingMorningNamed(name);
+    if (hour < 17) return name == null ? l10n.homeGreetingAfternoon : l10n.homeGreetingAfternoonNamed(name);
+    return name == null ? l10n.homeGreetingEvening : l10n.homeGreetingEveningNamed(name);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(20, 20, 20, 32),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildHeader(context),
+          const SizedBox(height: 14),
+          KeyedSubtree(key: widget.watchStatusKey, child: _buildStatusChip()),
+          const SizedBox(height: 18),
+
+          if (_uploadHealth != UploadHealth.ok) ...[
+            _buildUploadHealthBanner(),
+            const SizedBox(height: 16),
+          ],
+
+          // The key stays attached to whatever's currently in this slot —
+          // loading placeholder or the real content — so the coach-mark
+          // walkthrough (which spotlights this exact position for new
+          // signups) always has something to find, even mid-load.
+          KeyedSubtree(
+            key: widget.progressCardKey,
+            child: _loading
+                ? LoadingState(message: AppLocalizations.of(context)!.homeLoadingDashboard)
+                : _buildMainSection(),
+          ),
+
+          if (!_loading && _report == null) ...[
+            const SizedBox(height: 14),
+            _buildFactsGrid(),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(_getFormattedDate(), style: const TextStyle(color: AppColors.textSecondary, fontSize: 13)),
+              const SizedBox(height: 2),
+              Text(_greeting(), style: Theme.of(context).textTheme.headlineMedium),
+            ],
+          ),
+        ),
+        const SizedBox(width: 12),
+        GestureDetector(
+          onTap: () => widget.onNavigateToTab(3),
+          child: Container(
+            width: 36,
+            height: 36,
+            decoration: const BoxDecoration(color: AppColors.cardBackground, shape: BoxShape.circle),
+            child: const Icon(Icons.settings_outlined, color: AppColors.textSecondary, size: 18),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStatusChip() {
+    final color = _isConnected ? AppColors.primaryGreen : AppColors.warning;
+    final isColdStart = _isConnected && _coverageHours == 0;
+    return GestureDetector(
+      onTap: _isConnected ? null : () => widget.onNavigateToTab(2),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(color: color.withOpacity(0.12), borderRadius: BorderRadius.circular(20)),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            isColdStart
+                ? _PulsingDot(size: 7, color: color)
+                : Container(width: 7, height: 7, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+            const SizedBox(width: 6),
+            Text(
+              _isConnected
+                  ? AppLocalizations.of(context)!.homeWatchConnected
+                  : AppLocalizations.of(context)!.homeTapToConnect,
+              style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Deliberately quiet in the normal case: this only appears when
+  // checkUploadHealth() finds something actually wrong (no connection, or
+  // a real backlog) — not on every ordinary gap between auto-upload
+  // cycles, which used to make this show up almost constantly.
+  Widget _buildUploadHealthBanner() {
+    final l10n = AppLocalizations.of(context)!;
+    final isBacklog = _uploadHealth == UploadHealth.backlogRisk;
+    final icon = isBacklog ? Icons.cloud_off_rounded : Icons.wifi_off_rounded;
+    final text = isBacklog ? l10n.homeUploadBacklogText : l10n.homeNoConnectionText;
+
+    return GestureDetector(
+      onTap: isBacklog ? () => widget.onNavigateToTab(3) : null,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+        decoration: BoxDecoration(
+          color: AppColors.secondaryCoral.withOpacity(0.10),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: AppColors.secondaryCoral.withOpacity(0.3)),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: AppColors.secondaryCoral, size: 22),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                text,
+                style: const TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  height: 1.3,
+                ),
+              ),
+            ),
+            if (isBacklog) const Icon(Icons.chevron_right_rounded, color: AppColors.textSecondary),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMainSection() {
+    // State -1: the last load attempt threw — never leave the user staring
+    // at an infinite spinner. Takes priority over everything else since
+    // none of the other states have trustworthy data to show anyway.
+    if (_loadError != null) {
+      return _buildErrorCard();
+    }
+
+    // State 1: report ready — compact summary + link to the full report.
+    // Takes priority over the paused state below: data collection auto-
+    // stops the moment the report finishes computing (see
+    // _maybeGenerateReport), but the report itself is still what the user
+    // wants to see and act on until they've saved or dismissed it.
+    if (_report != null) {
+      return _buildReportReadyCard(_report!);
+    }
+
+    // State 0: paused — nothing left to show progress toward once
+    // collection has stopped and there's no pending report to review.
+    if (_paused) {
+      return _buildPausedCard();
+    }
+
+    // State 2: 48h reached, report not computed yet
+    if (_coverageHours >= _collectionGoalHours || _generatingReport) {
+      return _buildGeneratingCard();
+    }
+
+    // State 3: still collecting toward (or hasn't started) the 48h goal
+    return _buildProgressHeroCard();
+  }
+
+  // The error text itself is shown, not just a generic "something went
+  // wrong" — on a release build there's no debug panel to pull logs from,
+  // so a screenshot of this card is the only way a real failure ever gets
+  // reported back to us with enough detail to actually diagnose it.
+  Widget _buildErrorCard() {
+    final l10n = AppLocalizations.of(context)!;
+    return _heroCardChrome(
+      leading: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(color: AppColors.error.withOpacity(0.12), shape: BoxShape.circle),
+        child: const Icon(Icons.error_outline_rounded, color: AppColors.error, size: 32),
+      ),
+      title: l10n.homeLoadErrorTitle,
+      caption: l10n.homeLoadErrorCaption,
+      action: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: () {
+                setState(() => _loading = true);
+                _loadStats();
+              },
+              icon: const Icon(Icons.refresh_rounded, size: 18),
+              label: Text(l10n.homeTryAgain),
+            ),
+          ),
+          const SizedBox(height: 10),
+          SelectableText(
+            _loadError ?? '',
+            style: TextStyle(fontSize: 11, color: AppColors.textSecondary.withOpacity(0.8), fontFamily: 'monospace'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Puts the actual Start action right here rather than only sending the
+  // user to Settings' "Recording" section — this is the moment they're
+  // most likely to want it (they just saw "Recording stopped"), and making
+  // them navigate away for a one-tap action added friction for no reason.
+  // Settings still has the same control too, for parity with everything
+  // else that lives there.
+  Widget _buildPausedCard() {
+    final l10n = AppLocalizations.of(context)!;
+    return _heroCardChrome(
+      leading: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(color: AppColors.textSecondary.withOpacity(0.12), shape: BoxShape.circle),
+        child: const Icon(Icons.pause_rounded, color: AppColors.textSecondary, size: 32),
+      ),
+      title: l10n.homePausedTitle,
+      caption: l10n.homePausedCaption,
+      action: SizedBox(
+        width: double.infinity,
+        child: FilledButton.icon(
+          onPressed: _startingRecording ? null : _startNewRecording,
+          icon: _startingRecording
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                )
+              : const Icon(Icons.play_arrow_rounded, size: 18),
+          label: Text(l10n.settingsStartNewRecording),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _startNewRecording() async {
+    setState(() => _startingRecording = true);
+    await ReportService.setPaused(false);
+    await ReportService.startNewSession();
+    await BackgroundSyncService.instance.ensureScheduled();
+    if (!mounted) return;
+    setState(() {
+      _startingRecording = false;
+      _paused = false;
+      _coverageHours = 0;
+      _sessionStart = null;
+    });
+    await _loadStats();
+  }
+
+  Widget _buildProgressHeroCard() {
+    final l10n = AppLocalizations.of(context)!;
+    // The gap right after connecting: no crash, nothing broken, just not
+    // enough data yet for the ring to mean anything — without some signal
+    // here it reads as "is this working?" instead of "this is normal".
+    if (_isConnected && _coverageHours == 0) {
+      final hasReading = _totalReadings > 0;
+      return _heroCardChrome(
+        leading: const _PulsingHeartRing(size: 84),
+        title: hasReading ? l10n.homeYoureRecording : l10n.homeWaitingFirstReading,
+        caption: hasReading ? l10n.homeKeepWearingCaption : l10n.homeKeepNearbyCaption,
+      );
+    }
+
+    final progress = (_coverageHours / _collectionGoalHours).clamp(0.0, 1.0);
+    final remaining = _collectionGoalHours - _coverageHours;
+    final started = _coverageHours > 0 || _isConnected;
+
+    final String title;
+    final String caption;
+    if (!started) {
+      title = l10n.homeReadyTitle;
+      caption = l10n.homeReadyCaption;
+    } else if (progress < 0.5) {
+      title = l10n.homeJustStartedTitle;
+      caption = l10n.homeJustStartedCaption(_coverageHours);
+    } else {
+      title = l10n.homeHalfwayTitle;
+      caption = l10n.homeHalfwayCaption(remaining);
+    }
+
+    return _heroCardChrome(
+      leading: SizedBox(
+        width: 84,
+        height: 84,
+        child: CustomPaint(
+          painter: _ProgressRingPainter(
+            progress: progress,
+            trackColor: AppColors.primaryGreen.withOpacity(0.18),
+            fillColor: AppColors.primaryGreen,
+          ),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  '$_coverageHours',
+                  style: const TextStyle(color: AppColors.textPrimary, fontSize: 20, fontWeight: FontWeight.w700),
+                ),
+                Text(l10n.homeOf48h, style: const TextStyle(color: AppColors.textSecondary, fontSize: 10)),
+              ],
+            ),
+          ),
+        ),
+      ),
+      title: title,
+      caption: caption,
+    );
+  }
+
+  Widget _heroCardChrome({required Widget leading, required String title, required String caption, Widget? action}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: AppColors.primaryGreen.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              leading,
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: const TextStyle(color: AppColors.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 4),
+                    Text(caption, style: const TextStyle(color: AppColors.textSecondary, fontSize: 13, height: 1.4)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (action != null) ...[
+            const SizedBox(height: 16),
+            action,
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFactsGrid() {
+    final l10n = AppLocalizations.of(context)!;
+    return Column(
+      children: [
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: _buildFactTile(
+                  icon: Icons.favorite_border,
+                  iconColor: const Color(0xFF993556),
+                  iconBg: const Color(0xFFFBEAF0),
+                  value: _restingHR != null ? '$_restingHR' : '--',
+                  unit: _restingHR != null ? 'bpm' : '',
+                  label: l10n.homeFactRestingHR,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _buildFactTile(
+                  icon: Icons.graphic_eq,
+                  iconColor: const Color(0xFF0F6E56),
+                  iconBg: const Color(0xFFE1F5EE),
+                  value: _signalQuality > 0 ? '$_signalQuality' : '--',
+                  unit: _signalQuality > 0 ? '%' : '',
+                  label: l10n.homeFactSignalQuality,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: _buildFactTile(
+                  icon: Icons.check_circle_outline,
+                  iconColor: const Color(0xFF3B6D11),
+                  iconBg: const Color(0xFFEAF3DE),
+                  value: '$_hoursWornToday',
+                  unit: 'h',
+                  label: l10n.homeWornToday(_gapsToday),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _buildFactTile(
+                  icon: Icons.directions_walk,
+                  iconColor: const Color(0xFF3C3489),
+                  iconBg: const Color(0xFFEEEDFE),
+                  value: _movementLabel,
+                  unit: '',
+                  label: _movementCaption,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFactTile({
+    required IconData icon,
+    required Color iconColor,
+    required Color iconBg,
+    required String value,
+    required String unit,
+    required String label,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(color: AppColors.cardBackground, borderRadius: BorderRadius.circular(14)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(color: iconBg, borderRadius: BorderRadius.circular(8)),
+            child: Icon(icon, color: iconColor, size: 15),
+          ),
+          const SizedBox(height: 10),
+          RichText(
+            text: TextSpan(
+              children: [
+                TextSpan(
+                  text: value,
+                  style: const TextStyle(color: AppColors.textPrimary, fontSize: 17, fontWeight: FontWeight.w700),
+                ),
+                if (unit.isNotEmpty)
+                  TextSpan(
+                    text: ' $unit',
+                    style: const TextStyle(color: AppColors.textSecondary, fontSize: 11, fontWeight: FontWeight.w400),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            label,
+            style: const TextStyle(color: AppColors.textSecondary, fontSize: 11, height: 1.3),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGeneratingCard() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 24),
+      decoration: BoxDecoration(
+        color: AppColors.cardBackground,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.05),
+            blurRadius: 16,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          const CircularProgressIndicator(color: AppColors.primaryGreen),
+          const SizedBox(height: 18),
+          Text(
+            AppLocalizations.of(context)!.homeGeneratingTitle,
+            style: const TextStyle(color: AppColors.textPrimary, fontSize: 16, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            AppLocalizations.of(context)!.homeGeneratingCaption,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AppColors.textSecondary, fontSize: 13, height: 1.5),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReportReadyCard(FinalReport report) {
+    final l10n = AppLocalizations.of(context)!;
+    final color = _riskColor(report.riskLevel);
+    final label = _riskLabel(report.riskLevel);
+    final pct = (report.score * 100).round();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 20),
+      decoration: BoxDecoration(
+        color: AppColors.cardBackground,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: color.withOpacity(0.25), width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: color.withOpacity(0.12),
+            blurRadius: 24,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          // Header row
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                l10n.homeCardiacRiskReport,
+                style: const TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  label.toUpperCase(),
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          // Animated arc gauge
+          TweenAnimationBuilder<double>(
+            tween: Tween(begin: 0.0, end: report.score),
+            duration: const Duration(milliseconds: 1000),
+            curve: Curves.easeOutCubic,
+            builder: (context, animated, _) {
+              return SizedBox(
+                width: 200,
+                height: 130,
+                child: CustomPaint(
+                  painter: _RiskGaugePainter(
+                    progress: animated,
+                    trackColor: Colors.grey.shade200,
+                    fillColor: color,
+                  ),
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '$pct%',
+                          style: TextStyle(
+                            color: color,
+                            fontSize: 52,
+                            fontWeight: FontWeight.bold,
+                            height: 1.0,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          label,
+                          style: TextStyle(
+                            color: color.withOpacity(0.8),
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+
+          // Footer
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.access_time, size: 12, color: AppColors.textSecondary),
+              const SizedBox(width: 4),
+              Text(
+                l10n.homeGeneratedAt(_formatTime(report.computedAt)),
+                style: const TextStyle(color: AppColors.textSecondary, fontSize: 11),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => ReportScreen(report: report)),
+              ),
+              icon: const Icon(Icons.description_outlined, size: 18),
+              label: Text(l10n.homeViewFullReport),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: color,
+                side: BorderSide(color: color.withOpacity(0.4)),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: TextButton.icon(
+              onPressed: _savingSession ? null : () => _saveSession(report),
+              icon: _savingSession
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.archive_outlined, size: 16),
+              label: Text(_savingSession ? l10n.homeSaving : l10n.homeSaveReport),
+              style: TextButton.styleFrom(foregroundColor: AppColors.textSecondary),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _getFormattedDate() {
+    return DateFormat('EEEE, MMMM d', Localizations.localeOf(context).toString()).format(DateTime.now());
+  }
+}
+
+class _ProgressRingPainter extends CustomPainter {
+  final double progress;
+  final Color trackColor;
+  final Color fillColor;
+
+  const _ProgressRingPainter({
+    required this.progress,
+    required this.trackColor,
+    required this.fillColor,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = (size.shortestSide - 8) / 2;
+    const strokeWidth = 8.0;
+
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = trackColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth,
+    );
+
+    final sweep = 2 * math.pi * progress.clamp(0.0, 1.0);
+    if (sweep > 0.01) {
+      canvas.drawArc(
+        Rect.fromCircle(center: center, radius: radius),
+        -math.pi / 2,
+        sweep,
+        false,
+        Paint()
+          ..color = fillColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = strokeWidth
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_ProgressRingPainter old) =>
+      old.progress != progress || old.fillColor != fillColor;
+}
+
+class _RiskGaugePainter extends CustomPainter {
+  final double progress;
+  final Color trackColor;
+  final Color fillColor;
+
+  // 240° arc: starts at 150° (bottom-left), sweeps clockwise to 30° (bottom-right)
+  static const double _startAngle = 5 * math.pi / 6; // 150°
+  static const double _totalSweep = 4 * math.pi / 3; // 240°
+
+  const _RiskGaugePainter({
+    required this.progress,
+    required this.trackColor,
+    required this.fillColor,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height * 0.72);
+    final radius = size.width * 0.42;
+    const strokeWidth = 13.0;
+
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      _startAngle,
+      _totalSweep,
+      false,
+      Paint()
+        ..color = trackColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth
+        ..strokeCap = StrokeCap.round,
+    );
+
+    final sweep = _totalSweep * progress.clamp(0.0, 1.0);
+    if (sweep > 0.01) {
+      canvas.drawArc(
+        Rect.fromCircle(center: center, radius: radius),
+        _startAngle,
+        sweep,
+        false,
+        Paint()
+          ..color = fillColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = strokeWidth
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_RiskGaugePainter old) =>
+      old.progress != progress || old.fillColor != fillColor;
+}
+
+/// A small "recording live" indicator — a solid dot with a ring that
+/// expands and fades outward on a loop. No numbers, just proof the
+/// connection is alive. Used in the status chip during the cold-start gap
+/// (connected, but not enough data yet for the hour-coverage ring to mean
+/// anything).
+class _PulsingDot extends StatefulWidget {
+  final double size;
+  final Color color;
+
+  const _PulsingDot({required this.size, required this.color});
+
+  @override
+  State<_PulsingDot> createState() => _PulsingDotState();
+}
+
+class _PulsingDotState extends State<_PulsingDot> with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400))..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: widget.size * 3,
+      height: widget.size * 3,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) {
+          final t = _controller.value;
+          return Stack(
+            alignment: Alignment.center,
+            children: [
+              Opacity(
+                opacity: (1 - t) * 0.6,
+                child: Transform.scale(
+                  scale: 1 + t * 2.2,
+                  child: Container(
+                    width: widget.size,
+                    height: widget.size,
+                    decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
+                  ),
+                ),
+              ),
+              Container(
+                width: widget.size,
+                height: widget.size,
+                decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// The hero-card version of the same "we're listening" cue: a breathing
+/// ring around a gently pulsing heart icon. Deliberately shows no number —
+/// this is proof-of-connection, not a live vital, so it can't be mistaken
+/// for a health reading or the (48h-gated) risk score.
+class _PulsingHeartRing extends StatefulWidget {
+  final double size;
+
+  const _PulsingHeartRing({required this.size});
+
+  @override
+  State<_PulsingHeartRing> createState() => _PulsingHeartRingState();
+}
+
+class _PulsingHeartRingState extends State<_PulsingHeartRing> with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400))..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: widget.size,
+      height: widget.size,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) {
+          final t = _controller.value;
+          final heartScale = 0.92 + (math.sin(t * math.pi) * 0.08);
+          return Stack(
+            alignment: Alignment.center,
+            children: [
+              Opacity(
+                opacity: (1 - t).clamp(0.0, 1.0) * 0.5,
+                child: Transform.scale(
+                  scale: 1 + t * 0.35,
+                  child: Container(
+                    width: widget.size,
+                    height: widget.size,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: AppColors.primaryGreen, width: 2),
+                    ),
+                  ),
+                ),
+              ),
+              Container(
+                width: widget.size * 0.72,
+                height: widget.size * 0.72,
+                decoration: BoxDecoration(color: AppColors.primaryGreen.withOpacity(0.15), shape: BoxShape.circle),
+              ),
+              Transform.scale(
+                scale: heartScale,
+                child: Icon(Icons.favorite_rounded, color: AppColors.primaryGreen, size: widget.size * 0.32),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}

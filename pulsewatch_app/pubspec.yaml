@@ -1,0 +1,95 @@
+name: pulsewatch_app
+description: "PulseWatch AI - Medical Research System for Heart Sclerosis Detection"
+publish_to: 'none'
+
+version: 1.0.0+16
+
+environment:
+  sdk: ^3.10.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # English/Chinese UI localization
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.20.2
+
+  # BLE Communication
+  flutter_blue_plus: ^1.35.2
+  
+  # Local Database
+  sqflite: ^2.4.1
+  path: ^1.9.0
+
+  # Secure token storage (Keychain / EncryptedSharedPreferences)
+  flutter_secure_storage: ^9.2.2
+
+  # Biometric / device PIN app-lock
+  local_auth: ^2.3.0
+  
+  # State Management
+  provider: ^6.1.2
+  
+  # HTTP Client for Backend API
+  http: ^1.2.0
+  
+  # File System Access
+  path_provider: ^2.1.1
+  
+  # CSV Sharing
+  share_plus: ^7.2.1
+
+  # Opening mailto: (support/withdrawal requests) and the study website
+  url_launcher: ^6.3.1
+
+  # Device manufacturer detection, for the OEM-specific "Autostart"
+  # background-permission prompt (see services/autostart_service.dart)
+  device_info_plus: ^12.4.0
+
+  # Launching the manufacturer-specific autostart settings screen — same
+  # purpose as above
+  android_intent_plus: ^6.1.0
+
+  # PDF report generation (Cardiac Risk Report — proper paginated document,
+  # not a screenshot, so OS print/save-as-PDF actually works correctly)
+  pdf: ^3.11.1
+  printing: ^5.13.4
+
+  # Settings Storage
+  shared_preferences: ^2.2.2
+
+  # Icons
+  cupertino_icons: ^1.0.8
+
+  # On-device ONNX inference
+  onnxruntime: ^1.4.1
+
+  # Local notifications for patient alerts
+  flutter_local_notifications: ^18.0.1
+  flutter_foreground_task: ^10.0.0
+
+  # Periodic background BLE sync (see lib/services/background_sync_service.dart)
+  # — the actual 48h data-completeness guarantee, independent of whether the
+  # app process/foreground service survives being backgrounded that long.
+  workmanager: ^0.6.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  sqflite_common_ffi: ^2.3.3
+
+  # Faking secure storage in widget tests that boot the real app (see
+  # test/language_switch_test.dart) — not otherwise used at runtime.
+  flutter_secure_storage_platform_interface: ^1.1.2
+
+flutter:
+  uses-material-design: true
+  generate: true
+
+  assets:
+    - assets/models/model.onnx
+    - assets/models/feature_names.json
+    - assets/models/feature_importance.json
