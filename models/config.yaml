@@ -1,0 +1,23 @@
+
+# Central configuration for the AI model training / evaluation / export
+# pipeline. Read by models/train.py, models/evaluate.py,
+# models/visualize_evaluation.py, and models/convert_to_tflite.py.
+#
+# This file was missing from the repo -- none of the scripts above can run
+# without it. Paths are relative to the repo root.
+
+paths:
+  processed_data: data/processed   # expects train_balanced.csv, val_balanced.csv, test_balanced.csv
+  models: models                   # where cardiosclerosis_model_v1.pkl is read/written
+  output: output                   # where evaluation plots are written
+
+model:
+  params:
+    n_estimators: 200
+    max_depth: 6
+    learning_rate: 0.1
+    subsample: 0.8
+    colsample_bytree: 0.8
+    eval_metric: logloss
+    early_stopping_rounds: 20
+    random_state: 42
