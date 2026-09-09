@@ -1,12 +1,3 @@
-"""
-models/save_model.py
---------------------
-Utility to serialize / inspect saved model artifacts.
-
-Usage:
-  python models/save_model.py --inspect          # Print artifact metadata
-  python models/save_model.py --export-onnx      # Export to ONNX (optional)
-"""
 
 import argparse
 import joblib
@@ -32,16 +23,16 @@ def save_model(model, scaler, feature_names: list, path: str):
         "feature_names": feature_names,
     }
     joblib.dump(artifacts, path)
-    print(f"✅ Model artifacts saved to: {path}")
+    print(f"Model artifacts saved to: {path}")
 
 
 def inspect_model(path: Path):
     """Print metadata about a saved model artifact."""
     if not path.exists():
-        print(f"❌ File not found: {path}")
+        print(f"ERROR: File not found: {path}")
         return
     artifacts = joblib.load(path)
-    print(f"\n🔍 Model Artifact: {path.name}")
+    print(f"\nModel Artifact: {path.name}")
     print(f"   Keys: {list(artifacts.keys())}")
     model = artifacts.get("model")
     if model is not None:
@@ -59,13 +50,17 @@ def inspect_model(path: Path):
 
 
 def export_onnx(path: Path):
-    """Export XGBoost model to ONNX format for edge deployment."""
+
     try:
-        from skl2onnx import convert_sklearn
+        from skl2onnx import convert_sklearn, update_registered_converter
         from skl2onnx.common.data_types import FloatTensorType
+        from skl2onnx.common.shape_calculator import calculate_linear_classifier_output_shapes
+        from onnxmltools.convert.xgboost.operator_converters.XGBoost import convert_xgboost
         from sklearn.pipeline import Pipeline
-    except ImportError:
-        print("❌ Install skl2onnx: pip install skl2onnx onnxruntime")
+        from xgboost import XGBClassifier
+    except ImportError as e:
+        print(f"ERROR: missing dependency ({e}).")
+        print("Install with: pip install skl2onnx onnxmltools onnxruntime")
         return
 
     artifacts = joblib.load(path)
@@ -73,14 +68,28 @@ def export_onnx(path: Path):
     scaler = artifacts["scaler"]
     feature_names = artifacts["feature_names"]
 
+    update_registered_converter(
+        XGBClassifier, "XGBoostXGBClassifier",
+        calculate_linear_classifier_output_shapes,
+        convert_xgboost,
+        options={"nocl": [True, False], "zipmap": [True, False, "columns"]},
+    )
+
     pipeline = Pipeline([("scaler", scaler), ("model", model)])
     n_features = len(feature_names)
     initial_type = [("float_input", FloatTensorType([None, n_features]))]
-    onnx_model = convert_sklearn(pipeline, initial_types=initial_type)
+    onnx_model = convert_sklearn(
+        pipeline,
+        initial_types=initial_type,
+        target_opset={"": 15, "ai.onnx.ml": 3},
+        options={id(model): {"zipmap": False}},
+    )
     onnx_path = path.with_suffix(".onnx")
     with open(onnx_path, "wb") as f:
         f.write(onnx_model.SerializeToString())
-    print(f"✅ ONNX model exported: {onnx_path}")
+    print(f"ONNX model exported: {onnx_path}")
+    print("Reminder: this does not run the PKL-vs-ONNX smoke test that "
+          "convert_to_tflite.py does -- verify outputs match before deploying.")
 
 
 def main():
