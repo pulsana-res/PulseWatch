@@ -1,5 +1,3 @@
-
-
 import yaml
 import joblib
 import numpy as np
@@ -25,50 +23,54 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def main():
-    # ── Load model ────────────────────────────────────────────────────────────
+    # Load model 
     model_path = MODELS_DIR / "cardiosclerosis_model_v1.pkl"
     if not model_path.exists():
-        print(f"❌ {model_path} not found. Run models/train.py first.")
+        print(f"ERROR: {model_path} not found. Run models/train.py first.")
         return
-    print(f"📂 Loading model: {model_path}")
+    print(f"Loading model: {model_path}")
     artifacts = joblib.load(model_path)
     model = artifacts["model"]
     scaler = artifacts["scaler"]
     feature_names = artifacts["feature_names"]
 
-    # ── Load test set ─────────────────────────────────────────────────────────
+    #  Load test set
     test_path = PROCESSED_DIR / "test_balanced.csv"
     if not test_path.exists():
-        print(f"❌ {test_path} not found.")
+        print(f"ERROR: {test_path} not found.")
         return
     df_test = pd.read_csv(test_path)
     y_test = df_test["label"].astype(int)
     X_test = df_test.drop(columns=["label"])
-    # dataset_source may be in X_test if saved there
+  
     source_col = None
     if "dataset_source" in X_test.columns:
         sources = X_test["dataset_source"].copy()
         source_col = sources
         X_test = X_test.drop(columns=["dataset_source"])
 
-    # Align columns
-    for col in feature_names:
-        if col not in X_test.columns:
-            X_test[col] = 0.0
+    missing = [col for col in feature_names if col not in X_test.columns]
+    if missing:
+        print(f"WARNING: {len(missing)} feature(s) missing from test set, "
+              f"zero-filling: {missing}")
+        print("         This usually means the test CSV was built with a "
+              "different feature set than the model was trained on -- "
+              "check the data pipeline before trusting these metrics.")
+    for col in missing:
+        X_test[col] = 0.0
     X_test = X_test[feature_names]
 
     X_test_scaled = scaler.transform(X_test)
     y_proba = model.predict_proba(X_test_scaled)[:, 1]
     y_pred = (y_proba >= 0.5).astype(int)
 
-    # ── Overall metrics ───────────────────────────────────────────────────────
     acc = accuracy_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_proba)
     f1 = f1_score(y_test, y_pred)
     ap = average_precision_score(y_test, y_proba)
     brier = brier_score_loss(y_test, y_proba)
     print("\n" + "=" * 50)
-    print("📊 TEST SET EVALUATION")
+    print("TEST SET EVALUATION")
     print("=" * 50)
     print(f"  Accuracy      : {acc:.4f}")
     print(f"  AUC-ROC       : {auc:.4f}")
@@ -79,13 +81,13 @@ def main():
     print(classification_report(y_test, y_pred, target_names=["Healthy", "Cardiosclerosis"]))
 
     if auc >= 0.90:
-        print("✅ AUC target achieved (≥0.90)!")
+        print("AUC target achieved (>= 0.90).")
     else:
-        print(f"⚠️  AUC {auc:.4f} below target 0.90")
+        print(f"WARNING: AUC {auc:.4f} below target 0.90")
 
-    # ── Per-dataset breakdown ─────────────────────────────────────────────────
+    # Per-dataset breakdown 
     if source_col is not None:
-        print("\n📈 Per-Dataset Performance:")
+        print("\nPer-Dataset Performance:")
         df_eval = pd.DataFrame({"y_true": y_test.values, "y_pred": y_pred,
                                  "y_proba": y_proba, "source": source_col.values})
         for src, grp in df_eval.groupby("source"):
@@ -95,11 +97,11 @@ def main():
             src_acc = accuracy_score(grp["y_true"], grp["y_pred"])
             print(f"  {src:25s}  Acc={src_acc:.3f}  AUC={src_auc:.3f}  N={len(grp)}")
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
+  
     fig = plt.figure(figsize=(16, 10))
     gs = gridspec.GridSpec(2, 3, figure=fig)
 
-    # 1. Confusion Matrix
+    #  Confusion Matrix
     ax1 = fig.add_subplot(gs[0, 0])
     cm = confusion_matrix(y_test, y_pred)
     im = ax1.imshow(cm, cmap="Blues")
@@ -112,7 +114,7 @@ def main():
             ax1.text(j, i, cm[i, j], ha="center", va="center", fontsize=14,
                      color="white" if cm[i, j] > cm.max() / 2 else "black")
 
-    # 2. ROC Curve
+    # ROC 
     ax2 = fig.add_subplot(gs[0, 1])
     fpr, tpr, _ = roc_curve(y_test, y_proba)
     ax2.plot(fpr, tpr, "b-", lw=2, label=f"AUC = {auc:.3f}")
@@ -120,14 +122,14 @@ def main():
     ax2.set_xlabel("False Positive Rate"); ax2.set_ylabel("True Positive Rate")
     ax2.set_title("ROC Curve"); ax2.legend()
 
-    # 3. Precision-Recall Curve
+    # Precision-Recall Curve
     ax3 = fig.add_subplot(gs[0, 2])
     precision, recall, _ = precision_recall_curve(y_test, y_proba)
     ax3.plot(recall, precision, "r-", lw=2, label=f"AP = {ap:.3f}")
     ax3.set_xlabel("Recall"); ax3.set_ylabel("Precision")
     ax3.set_title("Precision-Recall Curve"); ax3.legend()
 
-    # 4. Calibration Plot
+    #  Calibration Plot
     ax4 = fig.add_subplot(gs[1, 0])
     prob_true, prob_pred = calibration_curve(y_test, y_proba, n_bins=10)
     ax4.plot(prob_pred, prob_true, "s-", color="blue", label="Model")
@@ -135,19 +137,19 @@ def main():
     ax4.set_xlabel("Mean Predicted Probability"); ax4.set_ylabel("Fraction of Positives")
     ax4.set_title("Calibration Plot"); ax4.legend()
 
-    # 5. Feature Importance (top 15)
+    # Feature Importance (top 15)
     ax5 = fig.add_subplot(gs[1, 1:])
     importances = pd.Series(model.feature_importances_, index=feature_names).nlargest(15)
     importances.sort_values().plot(kind="barh", ax=ax5, color="steelblue")
     ax5.set_title("Top 15 Feature Importances (XGBoost)")
     ax5.set_xlabel("Importance Score")
 
-    plt.suptitle("Heart Sclerosis Model — Test Set Evaluation", fontsize=14, fontweight="bold")
+    plt.suptitle("Heart Sclerosis Model -- Test Set Evaluation", fontsize=14, fontweight="bold")
     plt.tight_layout()
     plot_path = OUTPUT_DIR / "evaluation_report.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-    print(f"\n📊 Evaluation plots saved: {plot_path}")
-    print("✅ Evaluation complete.")
+    print(f"\nEvaluation plots saved: {plot_path}")
+    print("Evaluation complete.")
 
 
 if __name__ == "__main__":
