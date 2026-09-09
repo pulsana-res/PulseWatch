@@ -1,5 +1,4 @@
 
-
 import sys
 import yaml
 import joblib
@@ -103,7 +102,6 @@ def plot_confusion_matrix(ax, y_true, y_pred):
     ax.set_title(f"Confusion Matrix   (Accuracy {acc:.1%})", fontsize=12, fontweight="bold", pad=12)
     ax.grid(False)
 
-
 def plot_roc(ax, y_true, y_proba):
     fpr, tpr, thresholds = roc_curve(y_true, y_proba)
     roc_auc = auc(fpr, tpr)
@@ -135,6 +133,7 @@ def plot_calibration(ax, y_true, y_proba):
     ax.set_title("Probability Calibration Curve", fontsize=12, fontweight="bold", pad=12)
     ax.legend(fontsize=9)
     ax.set_xlim(-0.02, 1.02); ax.set_ylim(-0.02, 1.02)
+
 
 def plot_prob_dist(ax, y_true, y_proba):
     healthy = y_proba[y_true == 0]
@@ -181,7 +180,8 @@ def plot_threshold_analysis(ax, y_true, y_proba):
     ax.set_title("Threshold Analysis: Precision-Recall Trade-off", fontsize=12, fontweight="bold", pad=12)
     ax.legend(fontsize=9, loc="lower left")
     ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
--
+
+
 def plot_metrics_summary(ax, y_true, y_pred, y_proba):
     ax.axis("off")
     acc  = accuracy_score(y_true, y_pred)
@@ -208,7 +208,7 @@ def plot_metrics_summary(ax, y_true, y_pred, y_proba):
     for i, (name, val, passed) in enumerate(metrics):
         y_pos = 0.88 - i * 0.13
         color = C_HEALTHY if passed else C_WARN
-     
+    
         marker = "PASS" if passed else "LOW"
         ax.text(0.05, y_pos, f"[{marker}]  {name}", transform=ax.transAxes,
                 fontsize=11, va="center", color="#333")
@@ -217,7 +217,6 @@ def plot_metrics_summary(ax, y_true, y_pred, y_proba):
                 facecolor=color, alpha=0.25, linewidth=0))
         ax.text(0.785, y_pos, val, transform=ax.transAxes,
                 fontsize=12, va="center", ha="center", fontweight="bold", color=color)
-
 
 def main():
     print("Loading model and test set...")
@@ -231,7 +230,6 @@ def main():
     auc_ = roc_auc_score(y_test, y_proba)
     print(f"   Test accuracy: {acc:.1%}  |  AUC: {auc_:.3f}")
 
-   
     plots = [
         ("eval_confusion_matrix.png",        "Confusion Matrix",                    (6, 5),  lambda ax: plot_confusion_matrix(ax, y_test, y_pred)),
         ("eval_roc_curve.png",               "ROC Curve",                           (6, 5),  lambda ax: plot_roc(ax, y_test, y_proba)),
@@ -249,7 +247,6 @@ def main():
         plt.close(fig)
         print(f"   saved {fname}")
 
-    # -- Summary: all 5 in one image -------------------------------------------
     print("\nGenerating combined summary image...")
     fig = plt.figure(figsize=(20, 12))
     fig.suptitle("Heart Sclerosis Model -- Full Evaluation Report",
