@@ -1,19 +1,4 @@
-"""
-visualize_evaluation.py
-=======================
-Generates a full visual evaluation report for the trained model.
 
-Saves to output/:
-  eval_confusion_matrix.png
-  eval_roc_curve.png
-  eval_calibration_curve.png
-  eval_probability_distribution.png
-  eval_threshold_analysis.png
-  eval_summary.png   ← all 5 panels in one image
-
-Usage:
-  python models/visualize_evaluation.py
-"""
 
 import sys
 import yaml
@@ -43,7 +28,6 @@ MODELS_DIR    = ROOT / CONFIG["paths"]["models"]
 OUTPUT_DIR    = ROOT / CONFIG["paths"]["output"]
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Colour palette ─────────────────────────────────────────────────────────────
 C_HEALTHY  = "#4CAF50"   # green
 C_CARDIO   = "#F44336"   # red
 C_NEUTRAL  = "#2196F3"   # blue
@@ -67,7 +51,7 @@ plt.rcParams.update({
 def load_artifacts():
     path = MODELS_DIR / "cardiosclerosis_model_v1.pkl"
     if not path.exists():
-        print(f"❌ Model not found: {path}\n   Run: python models/train.py first.")
+        print(f"ERROR: Model not found: {path}\n   Run: python models/train.py first.")
         sys.exit(1)
     art = joblib.load(path)
     return art["model"], art["scaler"], art["feature_names"]
@@ -76,21 +60,23 @@ def load_artifacts():
 def load_test_set(feature_names):
     path = PROCESSED_DIR / "test_balanced.csv"
     if not path.exists():
-        print(f"❌ Test set not found: {path}\n   Run the data pipeline first.")
+        print(f"ERROR: Test set not found: {path}\n   Run the data pipeline first.")
         sys.exit(1)
     df = pd.read_csv(path)
     y  = df["label"].astype(int).values
     X  = df.drop(columns=["label"])
     if "dataset_source" in X.columns:
         X = X.drop(columns=["dataset_source"])
-    for col in feature_names:
-        if col not in X.columns:
-            X[col] = 0.0
+    missing = [col for col in feature_names if col not in X.columns]
+    if missing:
+        print(f"WARNING: {len(missing)} feature(s) missing from test set, "
+              f"zero-filling: {missing}")
+    for col in missing:
+        X[col] = 0.0
     X = X[feature_names].fillna(0.0)
     return X, y
 
 
-# ── 1. Confusion Matrix ────────────────────────────────────────────────────────
 def plot_confusion_matrix(ax, y_true, y_pred):
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
@@ -118,7 +104,6 @@ def plot_confusion_matrix(ax, y_true, y_pred):
     ax.grid(False)
 
 
-# ── 2. ROC Curve ──────────────────────────────────────────────────────────────
 def plot_roc(ax, y_true, y_proba):
     fpr, tpr, thresholds = roc_curve(y_true, y_proba)
     roc_auc = auc(fpr, tpr)
@@ -136,8 +121,6 @@ def plot_roc(ax, y_true, y_proba):
     ax.legend(fontsize=9, loc="lower right")
     ax.set_xlim(-0.02, 1.02); ax.set_ylim(-0.02, 1.02)
 
-
-# ── 3. Calibration Curve ──────────────────────────────────────────────────────
 def plot_calibration(ax, y_true, y_proba):
     prob_true, prob_pred = calibration_curve(y_true, y_proba, n_bins=10)
     brier = brier_score_loss(y_true, y_proba)
@@ -153,8 +136,6 @@ def plot_calibration(ax, y_true, y_proba):
     ax.legend(fontsize=9)
     ax.set_xlim(-0.02, 1.02); ax.set_ylim(-0.02, 1.02)
 
-
-# ── 4. Probability Distribution ───────────────────────────────────────────────
 def plot_prob_dist(ax, y_true, y_proba):
     healthy = y_proba[y_true == 0]
     cardiac = y_proba[y_true == 1]
@@ -171,7 +152,6 @@ def plot_prob_dist(ax, y_true, y_proba):
             ha="right", va="top", fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.8))
 
 
-# ── 5. Threshold Analysis ─────────────────────────────────────────────────────
 def plot_threshold_analysis(ax, y_true, y_proba):
     thresholds = np.linspace(0.01, 0.99, 200)
     precisions, recalls, f1s, accs = [], [], [], []
@@ -198,12 +178,10 @@ def plot_threshold_analysis(ax, y_true, y_proba):
     ax.axvline(0.5, color="black", lw=1.2, ls="--", alpha=0.5, label="Default threshold (0.5)")
     ax.set_xlabel("Decision Threshold", fontsize=10)
     ax.set_ylabel("Score", fontsize=10)
-    ax.set_title("Threshold Analysis: Precision–Recall Trade-off", fontsize=12, fontweight="bold", pad=12)
+    ax.set_title("Threshold Analysis: Precision-Recall Trade-off", fontsize=12, fontweight="bold", pad=12)
     ax.legend(fontsize=9, loc="lower left")
     ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
-
-
-# ── Summary panel ─────────────────────────────────────────────────────────────
+-
 def plot_metrics_summary(ax, y_true, y_pred, y_proba):
     ax.axis("off")
     acc  = accuracy_score(y_true, y_pred)
@@ -230,8 +208,9 @@ def plot_metrics_summary(ax, y_true, y_pred, y_proba):
     for i, (name, val, passed) in enumerate(metrics):
         y_pos = 0.88 - i * 0.13
         color = C_HEALTHY if passed else C_WARN
-        icon  = "✅" if passed else "⚠️"
-        ax.text(0.05, y_pos, f"{icon}  {name}", transform=ax.transAxes,
+     
+        marker = "PASS" if passed else "LOW"
+        ax.text(0.05, y_pos, f"[{marker}]  {name}", transform=ax.transAxes,
                 fontsize=11, va="center", color="#333")
         ax.add_patch(FancyBboxPatch((0.62, y_pos-0.045), 0.33, 0.09,
                 transform=ax.transAxes, boxstyle="round,pad=0.01",
@@ -240,9 +219,8 @@ def plot_metrics_summary(ax, y_true, y_pred, y_proba):
                 fontsize=12, va="center", ha="center", fontweight="bold", color=color)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    print("📂 Loading model and test set...")
+    print("Loading model and test set...")
     model, scaler, feature_names = load_artifacts()
     X_test, y_test = load_test_set(feature_names)
     X_scaled = scaler.transform(X_test)
@@ -253,7 +231,7 @@ def main():
     auc_ = roc_auc_score(y_test, y_proba)
     print(f"   Test accuracy: {acc:.1%}  |  AUC: {auc_:.3f}")
 
-    # ── Individual plots ───────────────────────────────────────────────────
+   
     plots = [
         ("eval_confusion_matrix.png",        "Confusion Matrix",                    (6, 5),  lambda ax: plot_confusion_matrix(ax, y_test, y_pred)),
         ("eval_roc_curve.png",               "ROC Curve",                           (6, 5),  lambda ax: plot_roc(ax, y_test, y_proba)),
@@ -269,12 +247,12 @@ def main():
         out = OUTPUT_DIR / fname
         fig.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        print(f"   💾 {fname}")
+        print(f"   saved {fname}")
 
-    # ── Summary: all 5 in one image ────────────────────────────────────────
-    print("\n📊 Generating combined summary image...")
+    # -- Summary: all 5 in one image -------------------------------------------
+    print("\nGenerating combined summary image...")
     fig = plt.figure(figsize=(20, 12))
-    fig.suptitle("Heart Sclerosis Model — Full Evaluation Report",
+    fig.suptitle("Heart Sclerosis Model -- Full Evaluation Report",
                  fontsize=16, fontweight="bold", y=0.98)
     gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.32)
 
@@ -299,13 +277,13 @@ def main():
     plt.close(fig)
 
     print(f"\n{'='*55}")
-    print(f"✅ All plots saved to {OUTPUT_DIR}")
-    print(f"   • eval_confusion_matrix.png")
-    print(f"   • eval_roc_curve.png")
-    print(f"   • eval_calibration_curve.png")
-    print(f"   • eval_probability_distribution.png")
-    print(f"   • eval_threshold_analysis.png")
-    print(f"   • eval_summary.png  ← all in one")
+    print(f"All plots saved to {OUTPUT_DIR}")
+    print(f"   - eval_confusion_matrix.png")
+    print(f"   - eval_roc_curve.png")
+    print(f"   - eval_calibration_curve.png")
+    print(f"   - eval_probability_distribution.png")
+    print(f"   - eval_threshold_analysis.png")
+    print(f"   - eval_summary.png  (all in one)")
     print(f"{'='*55}")
 
 
