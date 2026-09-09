@@ -13,10 +13,7 @@ MODELS_DIR = ROOT / CONFIG["paths"]["models"]
 
 
 def save_model(model, scaler, feature_names: list, path: str):
-    """
-    Serialize model pipeline to a .pkl file.
-    This is called automatically by train.py; expose here for manual use.
-    """
+  
     artifacts = {
         "model": model,
         "scaler": scaler,
@@ -27,7 +24,7 @@ def save_model(model, scaler, feature_names: list, path: str):
 
 
 def inspect_model(path: Path):
-    """Print metadata about a saved model artifact."""
+  
     if not path.exists():
         print(f"ERROR: File not found: {path}")
         return
