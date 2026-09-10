@@ -16,7 +16,6 @@ Supervisor: Prof. Dr. Ing. Nicolae Goga
 3. [What Is Currently Working](#what-is-currently-working)
 4. [Setup Guide](#setup-guide)
 5. [Where Things Live](#where-things-live)
-6. [Future Research Suggestions](#future-research-suggestions)
 
 ---
 
@@ -174,16 +173,11 @@ cd PulseWatch
 
 ### 2. Set Up the Watch Firmware
 
-1. Open [Bangle.js App Loader](https://banglejs.com/apps) in Chrome
-2. Connect your Bangle.js 2
-3. Upload these files from `bangle/`:
-   - `lib.js` → save as `pulsewatch` (no extension)
-   - `app.js` → save as `pulsewatch.app.js`
-   - `boot.js` → save as `pulsewatch.boot.js`
-   - `widget.js` → save as `pulsewatch.wid.js`
-4. Or use the Web IDE and upload `metadata.json` directly via the App Loader
-5. On the watch, go to Settings → enable recording via the PulseWatch menu
-6. The green dot widget confirms recording is active
+1. Go to [banglejs.com/apps](https://banglejs.com/apps/) in Chrome and connect to your Bangle.js 2
+2. Open the **More** tab → **Utilities** → **Install App from Files**, then select every file in this repo's `bangle/` folder and upload them to the watch
+3. Disconnect the watch from the website, then connect it to the PulseWatch phone app instead (see step 3 below) — recording starts automatically on connect
+4. A green dot in the top-right corner of the watch face confirms recording is active; if it doesn't appear, open the **PulseWatch** app on the watch itself and turn recording on manually
+5. See [pulsana.org/instructions](https://pulsana.org/instructions) for the full walkthrough with photos
 
 ### 3. Set Up the Flutter App
 
@@ -238,40 +232,3 @@ curl -H "Authorization: Bearer <your_access_token>" https://pulsana.org/patient/
 | `pulsewatch_backend/` | Flask API + website, deployed to `pulsana.org` | [`ARCHITECTURE.md`](pulsewatch_backend/ARCHITECTURE.md) |
 | `models/` | AI model training/evaluation/conversion scripts (XGBoost + ONNX/TFLite export) | — |
 | `server/` | Early prototype backend, superseded by `pulsewatch_backend/` — kept for reference, not active | — |
-
----
-
-## Future Research Suggestions
-
-**PPG morphology features**
-Two of the model's features (`systolic_upslope`, `diastolic_decay` — a combined ~14% of feature importance) need raw PPG waveform samples, which the current firmware doesn't expose (only derived BPM/confidence/RR). Getting real values here instead of training-set-mean placeholders would need firmware changes to stream raw PPG, which the Bangle.js HRM API may or may not support — worth investigating.
-
-**HRM duty-cycling for battery**
-The HRM sensor currently runs continuously while recording (needed for real HRV). Duty-cycling it (e.g. 10 minutes on, out of every 30) could meaningfully extend battery life, but trades off against data continuity and overnight/nocturnal-feature coverage — a product decision, not just an engineering one.
-
-**iOS support**
-The app is Android-only today. Bringing up iOS needs Xcode/macOS for builds, an Apple Developer account for any real distribution (TestFlight or App Store), and testing the BLE/biometric-lock/secure-storage code paths on iOS.
-
-**Play Store distribution**
-Currently distributed as a direct APK download (with the "unknown sources" install warning that implies). Moving to the Play Store would need a proper `applicationId` (currently the Flutter default `com.example.pulsewatch_app`), a Play Console account, and a release/versioning workflow.
-
-**Real informed-consent text**
-The website's `/join` consent page ships with placeholder text — needs the actual IRB-approved consent language before real participants use it.
-
-**On-device inference**
-Run the XGBoost model (converted to TensorFlow Lite Micro) directly on the Bangle.js 2, for a risk indicator on the watch face itself. Requires significant model compression and TFLite Micro integration with Espruino.
-
-**Database encryption**
-Local SQLite storage on the phone is currently unencrypted (`sqflite`, not `sqflite_sqlcipher`). Would need adding SQLCipher to match the privacy guarantees described in the project's write-up.
-
-**Prospective clinical validation**
-The current proof-of-concept used simulated/pilot data. The next scientific step is collecting data from participants with confirmed clinical diagnoses, validated by a cardiologist, to quantify how well the system performs on real Bangle.js PPG signals (which differ from the ECG-derived training data).
-
-**Multi-class severity grading**
-The current model is binary (Healthy / Cardiac). Extending to multi-class would allow Low / Medium / High / Critical risk levels, giving more actionable output for clinical screening.
-
-**Domain adaptation**
-The model was trained on ECG-derived RR intervals and wrist PPG from other devices. Bangle.js 2 PPG signals have different noise characteristics. Fine-tuning on a small amount of labeled Bangle.js data would reduce this domain shift and likely improve accuracy substantially.
-
-**Automated report delivery**
-Currently the researcher runs the inference script manually and reads the Markdown output. A future version could email or push the risk report to the participant or their clinician automatically after each 48-hour session completes.
