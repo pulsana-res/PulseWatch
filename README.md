@@ -49,7 +49,7 @@ Flutter Mobile App (Android — iOS not yet supported, see below)
      open, and via a ~15-min WorkManager background task otherwise
   └─ Computes an on-device risk estimate once a full 48h session is
      collected — never from a short live window
-  └─ Shows Home dashboard, Insights, Device, Upload, Settings screens
+  └─ Shows Home dashboard, Insights, Device, Settings screens (data export/upload lives in Settings, not a separate tab)
   └─ Optional biometric/PIN app-lock
   └─ Exports anonymized CSV (last 48 hours) and uploads over HTTPS
         │
@@ -89,11 +89,11 @@ See [`bangle/ARCHITECTURE.md`](bangle/ARCHITECTURE.md) for details.
 
 **Screens:**
 
+- **Landing** — first-run explainer of the 48h commitment, shown before Enroll/Login
 - **Home** — dashboard: watch connection status (tap to go connect it), 48-hour data-collection progress, cardiac risk gauge (computed once the full 48h session is collected), and a nudge if there's unsynced data waiting to be uploaded
 - **Insights** — weekly day-by-day data presence, 7-day heart rate stats plus average signal quality, days-recorded progress
 - **Device** — BLE scan and connect to Bangle.js 2 or T-Watch S3 Plus; Bangle.js always appears first; auto-starts recording on connection; real signal-quality reading (not a made-up score)
-- **Upload** — anonymized data export and upload to the research server, with a consent screen before every upload
-- **Settings** — account info, log out, biometric/PIN app-lock toggle (separated out from the Upload page, which used to hold all of this)
+- **Settings** — account info, log out, change password, biometric/PIN app-lock toggle, data export/upload to the research server, report history (past saved sessions), and language switch (English/Chinese)
 
 **Accounts & Privacy:**
 
@@ -102,6 +102,7 @@ See [`bangle/ARCHITECTURE.md`](bangle/ARCHITECTURE.md) for details.
 - No real name, birth year, or biological sex is collected anywhere anymore — the old profile-setup screen that did this was removed since nothing downstream (the model, the export) actually used that data
 - Tokens stored via `flutter_secure_storage` (Keychain/Keystore-backed), not plain SharedPreferences
 - Optional biometric/device-PIN app-lock, re-locks whenever the app leaves the foreground
+- Forgot password: a researcher can generate a one-time reset code for a locked-out patient
 
 **BLE Integration:**
 
@@ -118,6 +119,8 @@ See [`bangle/ARCHITECTURE.md`](bangle/ARCHITECTURE.md) for details.
 - `device_id` and `confidence` columns intentionally excluded from export
 - Consent bottom sheet before every upload — shows exactly what will be sent, requires explicit checkbox confirmation
 - Uploads authenticate with a JWT bearer token (not a client-supplied patient ID header, which could previously be spoofed)
+- Auto-upload is on by default (opt-out, not opt-in) — turning it off in Settings shows an explanatory sheet first; manual upload from Settings still has its own per-upload consent sheet
+- The full risk report can also be exported as a paginated PDF, not just CSV
 
 See [`pulsewatch_app/ARCHITECTURE.md`](pulsewatch_app/ARCHITECTURE.md) for details.
 
@@ -126,14 +129,14 @@ See [`pulsewatch_app/ARCHITECTURE.md`](pulsewatch_app/ARCHITECTURE.md) for detai
 Deployed on a DigitalOcean VPS at **pulsana.org**, behind nginx with a Let's Encrypt TLS certificate, running under systemd (gunicorn).
 
 **API (used by the app):**
-- `/auth/claim`, `/auth/login`, `/auth/refresh`, `/auth/enroll` — accounts and JWT tokens
+- `/auth/claim`, `/auth/login`, `/auth/refresh`, `/auth/enroll`, `/auth/change-password`, `/auth/reset-password` — accounts and JWT tokens
 - `/upload`, `/upload_chunk`, `/upload_recorder_log` — receive CSV data (patient identity comes from the verified token, never a client-supplied header)
 - `/patient/{id}/sessions`, `/patient/{id}/session/{id}/data` — read back a patient's data (patient can only read their own; researcher role can read any)
 - `/health` — health check
 
 **Website (server-rendered, no separate frontend framework):**
-- `/` — landing page
-- `/download` — consent/terms page → issues a one-time enrollment code → links to the Android APK
+- `/` — landing page, plus `/instructions`, `/faq`, `/contact`
+- `/join` — consent/terms page → issues a one-time enrollment code → links to the Android APK (`/download` still works as a redirect to `/join`, kept for old links/QR codes)
 - `/researcher/login`, `/researcher/dashboard`, `/researcher/patient/{id}` — session-cookie-based researcher portal: list patients, generate enrollment codes, download session CSVs
 
 See [`pulsewatch_backend/ARCHITECTURE.md`](pulsewatch_backend/ARCHITECTURE.md) for details, including how to run it locally and how it's deployed.
@@ -190,10 +193,10 @@ flutter pub get
 flutter run
 ```
 
-The app talks to the production backend at `https://pulsana.org` by default — no server setup needed to try it. To point it at your own backend instead, change `_defaultServerUrl` in `lib/services/server_service.dart`, or set the server URL from the Upload screen at runtime.
+The app talks to the production backend at `https://pulsana.org` by default — no server setup needed to try it. To point it at your own backend instead, change `_defaultServerUrl` in `lib/services/server_service.dart`, or set the server URL from Settings at runtime.
 
 **First launch:**
-- You'll be asked for an enrollment code (get one from `https://pulsana.org/download`, or have a researcher generate one from the portal) plus a username and password you choose
+- You'll be asked for an enrollment code (get one from `https://pulsana.org/join`, or have a researcher generate one from the portal) plus a username and password you choose
 - Returning users just log in with that username/password
 
 **Connect the watch:**
@@ -253,7 +256,7 @@ The app is Android-only today. Bringing up iOS needs Xcode/macOS for builds, an 
 Currently distributed as a direct APK download (with the "unknown sources" install warning that implies). Moving to the Play Store would need a proper `applicationId` (currently the Flutter default `com.example.pulsewatch_app`), a Play Console account, and a release/versioning workflow.
 
 **Real informed-consent text**
-The website's `/download` consent page ships with placeholder text — needs the actual IRB-approved consent language before real participants use it.
+The website's `/join` consent page ships with placeholder text — needs the actual IRB-approved consent language before real participants use it.
 
 **On-device inference**
 Run the XGBoost model (converted to TensorFlow Lite Micro) directly on the Bangle.js 2, for a risk indicator on the watch face itself. Requires significant model compression and TFLite Micro integration with Espruino.

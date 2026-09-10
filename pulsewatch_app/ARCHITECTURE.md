@@ -38,21 +38,23 @@ directly in its own `build()`, so its state — and the callback — survives
 the whole flow.
 
 `MainNavigation` holds the four bottom-nav tabs (Home, Insights, Device,
-Upload) and also handles: auto-upload on app resume, and reconnecting to the
-last-known BLE device on resume.
+Settings — there's no separate Upload tab; data export/upload now lives in
+`settings_screen.dart`) and also handles: auto-upload on app resume, and
+reconnecting to the last-known BLE device on resume.
 
 ## Screens
 
 | Screen | Purpose |
 |---|---|
+| `landing_screen.dart` | First screen a new participant sees, before Enroll/Login — explains the 48h commitment up front. |
 | `home_screen.dart` | Dashboard: watch status, 48h collection progress, live BPM + signal quality, upload nudge, and the risk report card (locked until 48h of data is collected, then triggers `report_service.dart`'s one-time full-session scoring). |
-| `report_screen.dart` | Full cardiac risk report — gauge, risk level/assessment, session overview, top contributing features with clinical descriptions. Pushed from the home screen once a report exists. |
+| `report_screen.dart` | Full cardiac risk report — gauge, risk level/assessment, session overview, top contributing features with clinical descriptions. Pushed from the home screen once a report exists. Can also be exported as a paginated PDF (`pdf_report_service.dart`). |
+| `report_history_screen.dart` | Every report the user has saved via Home's "Save report & start new session" action. Reached from Settings. |
 | `insights_screen.dart` | 7-day trends: daily presence, HR stats, average signal quality, days-recorded progress. |
 | `device_screen.dart` | BLE scan/connect/disconnect, signal quality (from real HRM confidence, not a synthetic score). |
-| `server_screen.dart` | "Upload" tab — server URL/connection test, data stats, consent-gated export & upload. Deliberately does *not* hold account/settings UI (see `settings_screen.dart`). |
-| `settings_screen.dart` | Account info, log out, biometric app-lock toggle. Split out from `server_screen.dart` — the upload page is about *where data goes*, this page is about *who the user is*. |
+| `settings_screen.dart` | Account info, log out, change password, biometric app-lock toggle, language switch, and data export/upload (server URL/connection test, data stats, consent-gated export & upload) — there is no separate Upload tab/screen; this page covers both *who the user is* and *where their data goes*. |
 | `enroll_screen.dart` | First-run: turn a researcher/website-issued enrollment code into an account (username + password). |
-| `login_screen.dart` | Returning-user login. |
+| `login_screen.dart` | Returning-user login, plus a forgot-password entry point (researcher-issued reset code). |
 | `lock_screen.dart` | Biometric/PIN gate, shown on launch and whenever the app returns from the background if app-lock is enabled. |
 
 ## Services
@@ -69,8 +71,13 @@ last-known BLE device on resume.
 | `inference_service.dart` | Runs the on-device ONNX model (`assets/models/model.onnx`) to turn features into a risk score for one window. |
 | `report_service.dart` | Owns the one-time full-session report: pulls the last 48h from the DB, slides 5-min/50%-overlap windows across all of it, averages the per-window probabilities into a session score, persists the result, and fires the risk alert/alarm once. |
 | `server_service.dart` | Server URL config, CSV export, upload, auto-upload eligibility. |
+| `pdf_report_service.dart` | Renders the risk report as a paginated PDF (mirrors `report_screen.dart`'s content) so the OS print/save-as-PDF flow works properly. |
+| `upload_consent_service.dart` | Whether background auto-upload is allowed (on by default — opt-out, not opt-in); separate from the manual upload flow's own per-upload consent sheet. |
 | `biometric_lock_service.dart` | Wraps `local_auth` for the app-lock feature. |
 | `notification_service.dart` | Local push notification when a risk alert fires. |
+| `locale_service.dart` | Persists the user's English/Chinese choice (Landing screen toggle or Settings' language picker); a device-level preference, not tied to which account is logged in. |
+| `autostart_service.dart` | One-time prompt for OEM "Autostart"/"Protected apps" permissions (MIUI, ColorOS, Funtouch OS, EMUI, etc.) — a separate permission layer from Android's own battery-optimization exemption; some OEM skins block background service/boot-receiver access entirely without it. |
+| `foreground_task_handler.dart` | Keeps the background-sync foreground-service notification's "last reading Xm ago" text current via a periodic `onRepeatEvent`. |
 
 ## Data flow: watch → screen
 

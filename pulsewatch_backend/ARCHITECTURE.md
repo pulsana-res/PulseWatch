@@ -19,9 +19,13 @@ pulsewatch_backend/
 ├── auth.py             # Accounts, password hashing, enrollment codes (SQLite)
 ├── create_admin.py     # CLI to bootstrap a researcher account (not an API route)
 ├── templates/           # Jinja2 HTML — the actual website pages
-│   ├── base.html         # Shared layout + all CSS
+│   ├── pulsana_base.html # Shared layout + all CSS
+│   ├── researcher_base.html # Shared layout for the researcher portal
 │   ├── index.html        # Landing page
-│   ├── download.html     # Consent page → issues enrollment code → APK link
+│   ├── instructions.html, faq.html, contact.html
+│   ├── join.html         # Consent page → issues enrollment code → APK link
+│   │                      # (the old `download.html`/`/download` route is now
+│   │                      #  just a redirect to `/join`, kept for old links)
 │   ├── researcher_login.html
 │   ├── researcher_dashboard.html
 │   └── researcher_patient.html
@@ -55,6 +59,8 @@ signer) — reusing the value is fine, they're independent mechanisms.
 | `/auth/login` | POST | none (rate-limited) | Username/password → tokens |
 | `/auth/refresh` | POST | refresh token | New access token |
 | `/auth/enroll` | POST | researcher JWT | Generate a code (used by `create_admin.py`-created accounts, or programmatically) |
+| `/auth/change-password` | POST | patient/researcher JWT | Change password, proving the current one first |
+| `/auth/reset-password` | POST | one-time reset code | Password reset for a locked-out patient, using a code a researcher generated |
 | `/upload`, `/upload_chunk`, `/upload_recorder_log` | POST | patient JWT | Receive CSV data. **`patient_id` always comes from the verified token**, never a client header — this closes an old hole where any client could claim to be any patient. |
 | `/patient/<id>/sessions`, `/patient/<id>/session/<id>/data` | GET | JWT | Read data — patient can only read their own; researcher role can read any |
 | `/health` | GET | none | Liveness check |
@@ -64,7 +70,11 @@ signer) — reusing the value is fine, they're independent mechanisms.
 | Route | What |
 |---|---|
 | `/` | Landing page |
-| `/download` | GET shows the consent form; POST (after checking "I agree") generates a one-time enrollment code and shows it + the APK link. Rate-limited to stop code-farming. |
+| `/instructions` | Setup/how-to-use instructions |
+| `/faq` | FAQ page |
+| `/contact` | GET shows the contact form; POST sends the message via the Gmail API (rate-limited, honeypot field against bots) — see "Deployment" below for the OAuth setup this needs |
+| `/join` | GET shows the consent form; POST (after checking "I agree") generates a one-time enrollment code and shows it + the APK link. Rate-limited to stop code-farming. |
+| `/download` | Legacy address for `/join` — kept as a 301 redirect so old links/bookmarks/QR codes still resolve |
 | `/download-apk` | Serves the static APK file for direct download |
 
 **Researcher portal (session cookie):**
@@ -73,9 +83,15 @@ signer) — reusing the value is fine, they're independent mechanisms.
 |---|---|
 | `/researcher/login` | GET shows the form, POST checks credentials and sets the session |
 | `/researcher/logout` | Clears the session |
-| `/researcher/dashboard` | Lists all patient accounts; also has the "generate enrollment code" form |
+| `/researcher/dashboard` | Lists all patient accounts |
+| `/researcher/generate-code` | POST — the dashboard's "generate enrollment code" form |
 | `/researcher/patient/<id>` | That patient's uploaded sessions, with download links |
+| `/researcher/patient/<id>/generate-reset-code` | POST — mints a one-time password-reset code for a locked-out patient (used with `/auth/reset-password`) |
+| `/researcher/patient/<id>/session/<id>/delete` | POST — deletes one session's uploaded data |
+| `/researcher/patient/<id>/sessions/delete` | POST — bulk-deletes multiple sessions |
+| `/researcher/patient/<id>/delete-all` | POST — deletes everything for one patient |
 | `/researcher/patient/<id>/session/<id>/download` | Streams the combined CSV for one session as a file download |
+| `/researcher/gmail-oauth/start`, `/researcher/gmail-oauth/callback` | One-time OAuth flow to authorize the contact-form's Gmail sender — see "Deployment" below |
 
 ## Why enrollment codes exist at all
 

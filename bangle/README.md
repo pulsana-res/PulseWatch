@@ -53,9 +53,11 @@ require('Storage').readJSON('pulsewatch.json')
 
 ### Configuration
 
-Edit `boot.js` to change save interval:
+Edit `CONFIG.saveInterval` at the top of `lib.js` to change how often
+buffered readings are flushed to flash (currently 5 minutes — see
+[`ARCHITECTURE.md`](ARCHITECTURE.md#configuration)):
 ```javascript
-saveInterval: 60 * 60 * 1000,  // 60 minutes for production
+saveInterval: 5 * 60 * 1000,  // 5 minutes
 ```
 
 ## Medical Research Use
