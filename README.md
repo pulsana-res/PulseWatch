@@ -138,14 +138,14 @@ Deployed on a DigitalOcean VPS at **pulsana.org**, behind nginx with a Let's Enc
 
 See [`pulsewatch_backend/ARCHITECTURE.md`](pulsewatch_backend/ARCHITECTURE.md) for details, including how to run it locally and how it's deployed.
 
-### AI Model (separate — not in this repo)
+### AI Model (`models/`)
 
 - Binary XGBoost classifier (n_estimators=200, max_depth=6)
 - Trained on 7 public datasets: CAST RR, MIT-BIH NSR, MIT-BIH LTDB, SCD Holter, TROIKA, GalaxyPPG (10.4M rows total)
 - Performance: Accuracy 0.85, AUC 0.91, Brier Score 0.082, Specificity 0.87
 - Extracts 20 features across 5-minute windows: HRV time-domain, HRV frequency-domain, PPG morphology, activity, nocturnal
 - Outputs a 0–1 risk probability and Markdown report
-- Training/evaluation/conversion scripts for this model live in `models/`, separate from the app's on-device ONNX copy in `pulsewatch_app/assets/models/`
+- Training/evaluation/conversion scripts for this model live in `models/` (see [`models/config.yaml`](models/config.yaml) for the pipeline config); a converted ONNX copy ships in `pulsewatch_app/assets/models/` and runs on-device in the app's release build for the lighter, real-time feature pipeline described above
 
 ---
 
@@ -165,8 +165,8 @@ See [`pulsewatch_backend/ARCHITECTURE.md`](pulsewatch_backend/ARCHITECTURE.md) f
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/FaMaHo/bangle_programming.git
-cd bangle_programming
+git clone https://github.com/pulsana-res/PulseWatch.git
+cd PulseWatch
 ```
 
 ### 2. Set Up the Watch Firmware
@@ -234,8 +234,6 @@ curl -H "Authorization: Bearer <your_access_token>" https://pulsana.org/patient/
 | `pulsewatch_app/` | Flutter mobile app | [`ARCHITECTURE.md`](pulsewatch_app/ARCHITECTURE.md) |
 | `pulsewatch_backend/` | Flask API + website, deployed to `pulsana.org` | [`ARCHITECTURE.md`](pulsewatch_backend/ARCHITECTURE.md) |
 | `models/` | AI model training/evaluation/conversion scripts (XGBoost + ONNX/TFLite export) | — |
-| `firmware/` | T-Watch S3 Plus firmware (secondary/experimental device) | — |
-| `docs/` | Hardware reference PDFs/notes (Bangle.js 2, MAX30102, LilyGo T-Watch S3 Plus) | — |
 | `server/` | Early prototype backend, superseded by `pulsewatch_backend/` — kept for reference, not active | — |
 
 ---

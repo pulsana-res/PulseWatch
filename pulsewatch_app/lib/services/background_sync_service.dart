@@ -68,11 +68,27 @@ void callbackDispatcher() {
         // future change to that logic can't turn into a Worker that never
         // returns, which would block Android from ever scheduling the next
         // run for this unique task.
+        //
+        // 9 minutes, not 4: the watch checkpoints a new file every 5 minutes
+        // regardless of whether anything is connected (see bangle/lib.js's
+        // saveData()), so any real gap in background execution — the phone
+        // locked overnight, an OEM battery manager delaying this task
+        // despite the exemption — lets many small backlogged files pile up.
+        // Draining that backlog is a sequential read-confirm-erase per file
+        // (_readNextFileBangle), on top of up to 60s just to reconnect
+        // (performBackgroundSync's autoConnectTimeout) — a real backlog of
+        // even a few hours' worth of files can easily take longer than 4
+        // minutes to fully drain, which cut a cycle off partway through and
+        // left the rest to trickle in a little at a time over many
+        // subsequent 15-minute cycles instead of catching up in one pass.
+        // Nothing was ever lost this way (a file is only erased once its
+        // rows are confirmed durably written), only slow to arrive — this
+        // just gives each cycle enough room to actually catch up.
         bool syncOk;
         try {
           syncOk = await BleService()
               .performBackgroundSync()
-              .timeout(const Duration(minutes: 4));
+              .timeout(const Duration(minutes: 9));
         } catch (_) {
           // Any uncaught exception here — including the timeout above —
           // is reported to WorkManager as a failure, which triggers its
